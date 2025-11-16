@@ -1,0 +1,2 @@
+TOKEN = your token without quotes
+GROUP_CHAT_IDS = -123456789, -98765432
