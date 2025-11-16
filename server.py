@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 DATA = {}
 # Чтение файла 'data_info.txt'
 try:
-    with open('data_info.cfg', 'r', encoding='utf-8') as file:
+    with open('data_info.txt', 'r', encoding='utf-8') as file:
         for line in file:
             # Очистка строки от пробелов и символов переноса
             line = line.strip()
@@ -888,3 +888,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
