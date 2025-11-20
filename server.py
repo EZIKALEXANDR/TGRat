@@ -50,7 +50,7 @@ clients = {}
 upload_requests = {}
 clients_lock = asyncio.Lock()
 HOST = '0.0.0.0'
-PORT = 1234
+PORT = 1234 # Поменять
 HISTORY_FILE = "client_history.json"
 clients = {}
 CLIENT_HISTORY_CACHE = {}
@@ -355,7 +355,7 @@ async def handle_client(reader, writer):
                         
                     # 4. Отправляем файл в Telegram
                     tg_file = FSInputFile(temp_file_path, filename=file_name)
-                    caption_text = res.get("result", f"✅ Вывод команды **{file_name}**:")
+                    caption_text = res.get("result", f"✅ Вывод команды *{file_name}*:")
                     
                     await bot.send_document(
                         chat_id=GROUP_CHAT_ID, 
@@ -447,7 +447,7 @@ async def handle_client(reader, writer):
             try:
                 await bot.send_message(
                     GROUP_CHAT_ID, 
-                    f"🔴 **Клиент {client_id} отключился (ОФФЛАЙН)!**", 
+                    f"🔴 *Клиент {client_id} отключился (ОФФЛАЙН)!*", 
                     message_thread_id=thread_id,
                     parse_mode='Markdown'
                 )
@@ -533,6 +533,8 @@ async def handle_help(message: Message):
 <code>/mousemove &lt;X&gt; &lt;Y&gt;</code> — переместить курсор
 <code>/keytype &lt;текст&gt;</code> — ввести текст (с поддержкой кириллицы)
 <code>/open_image &lt;сек&gt; &lt;путь&gt;</code> — открыть картинку на полный экран на N секунд
+<code>/applist [&lt;индекс&gt;]</code> — посмотреть список окон или вывести одно из них "вперед".
+<code>/applist_close &lt;индекс&gt;</code> — закрыть выбранное окно.
 
 <b>👾 Автоматизация</b>
 <code>/mousemesstart</code> — включить случайное движение мыши
@@ -558,7 +560,7 @@ async def handle_help(message: Message):
 <code>/clients</code> - посмотреть активных клиентов и их историю
 <code>/version</code> - посмотреть версию ПО на стороне клиента
 
-    <i>ver beta v16</i>"""
+    <i>ver beta v20</i>"""
     await message.reply(help_text, parse_mode="HTML")
 
 async def get_client_status(client_id):
@@ -616,7 +618,7 @@ async def handle_clients(message: Message):
         await message.reply("Нет зарегистрированных клиентов в истории.")
         return
 
-    response = ["**Клиенты (Онлайн / История):**"]
+    response = ["*Клиенты (Онлайн / История):*"]
     
     sorted_client_ids = sorted(CLIENT_HISTORY_CACHE.keys())
     
@@ -689,7 +691,7 @@ async def handle_msg(message: Message, command: CommandObject):
                 await bot.send_message(
                     chat_id=GROUP_CHAT_ID,
                     message_thread_id=thread_id,
-                    text=f"🔴 **Клиент {client_id_to_remove} отключился (ОФФЛАЙН)!**\n(Обнаружено при попытке отправки команды)",
+                    text=f"🔴 *Клиент {client_id_to_remove} отключился (ОФФЛАЙН)!*\n(Обнаружено при попытке отправки команды)",
                     parse_mode='Markdown'
                 )
             except Exception:
@@ -823,7 +825,7 @@ async def handle_file(message: Message):
         
         logger.info(f"Файл {fname} ({fsize}B) отправлен клиенту. Ожидаю подтверждения...")
         
-        await message.reply(f"✅ Файл **{fname}** ({fsize}B) отправлен клиенту. Ожидайте подтверждения о сохранении.")
+        await message.reply(f"✅ Файл *{fname}* ({fsize}B) отправлен клиенту. Ожидайте подтверждения о сохранении.")
              
     except Exception as e:
         await message.reply(f"❌ Ошибка загрузки: {e}")
