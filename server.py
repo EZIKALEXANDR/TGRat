@@ -57,7 +57,7 @@ clients = {}
 upload_requests = {}
 clients_lock = asyncio.Lock()
 HOST = '0.0.0.0'
-PORT = 7777 # Поменять
+PORT = 7777 # Поменять на свой
 HISTORY_FILE = "client_history.json"
 clients = {}
 CLIENT_HISTORY_CACHE = {}
@@ -364,16 +364,23 @@ async def handle_client(reader, writer):
         while True:
             try:
                 # 🔥 HEARTBEAT: Таймаут чтения 20 секунд
-                line = await asyncio.wait_for(reader.readline(), timeout=20)
+                line = await asyncio.wait_for(reader.readline(), timeout=25)
+
+                if not line: # EOF (клиент закрыл сокет корректно)
+                    break
+                    
                 if b'\x00' in line or any(b > 0xF4 for b in line):
                     # это бинарь → игнорируем до конца строки
                     continue
 
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
                 logger.warning(f"Таймаут чтения от {client_id}. Разрыв соединения.")
                 break # Выход из цикла, триггер finally
-            except ConnectionResetError:
-                break # Клиент закрыл соединение
+                
+            except Exception as e:
+                # А вот это уже реально странные ошибки
+                logger.error(f"Непредвиденная ошибка чтения {client_id}: {e}")
+                break
             
             if not line.endswith(b'\n'):
                 break
@@ -533,14 +540,16 @@ async def handle_client(reader, writer):
 
         # 3. Аккуратное закрытие писателя (с подавлением ConnectionResetError)
         if writer:
-            writer.close()
-            # 🔥 Изолируем проблемный вызов в try/except
             try:
-                await writer.wait_closed()
-            except ConnectionResetError:
+                writer.close()
+                # Мы даем сокету 1 секунду на закрытие, если не успел — игнорируем.
+                # Это предотвратит долгое зависание функции handle_client.
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (ConnectionResetError, ConnectionAbortedError, OSError, asyncio.TimeoutError):
+                # OSError: [Errno 113] No route to host упадет сюда и не будет спамить в консоль
                 pass 
-            except ConnectionAbortedError:
-                pass
+            except Exception as e:
+                logger.debug(f"Замалчиваемая ошибка закрытия: {e}")
                 
 async def tcp_server():
     server = await asyncio.start_server(handle_client, HOST, PORT)
@@ -550,15 +559,43 @@ async def tcp_server():
 
 async def check_clients_status():
     while True:
-        await asyncio.sleep(300)
+        # Уменьшим до 60 секунд, чтобы быстрее реагировать на лаги
+        await asyncio.sleep(60) 
         now = datetime.now()
+        
         async with clients_lock:
-            dead = [cid for cid, info in clients.items() if info["writer"] is None and (now - info["last_seen"]).total_seconds() > 600]
+            dead = []
+            for cid, info in clients.items():
+                last_diff = (now - info["last_seen"]).total_seconds()
+                
+                # Условие 1: Твоя оригинальная логика (уже отвалившиеся)
+                condition_orig = info["writer"] is None and last_diff > 600
+                
+                # Условие 2: Дополняем — если писатель есть, но от него нет вестей > 45 сек
+                # (при условии, что клиент шлет пинги каждые 5-10 сек)
+                condition_ghost = info["writer"] is not None and last_diff > 45
+                
+                if condition_orig or condition_ghost:
+                    dead.append(cid)
+
             for cid in dead:
-                tid = clients[cid]["thread_id"]
-                if tid:
-                    await bot.send_message(GROUP_CHAT_ID, f"⏰ Таймаут {cid}", message_thread_id=tid)
-                del clients[cid]
+                try:
+                    tid = clients[cid].get("thread_id")
+                    writer = clients[cid].get("writer")
+                    
+                    # Если соединение "призрачное", закрываем его принудительно
+                    if writer:
+                        writer.close()
+                        # Ждать drain тут не обязательно, т.к. мы в цикле очистки
+                    
+                    if tid:
+                        # Твое стандартное уведомление
+                        await bot.send_message(GROUP_CHAT_ID, f"⏰ Таймаут/Рассинхрон {cid}", message_thread_id=tid)
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении {cid}: {e}")
+                finally:
+                    if cid in clients:
+                        del clients[cid]
 
 
 # ====== TG хэндлеры ======
@@ -691,7 +728,7 @@ async def process_menu_navigation(callback: CallbackQuery):
 <code>/clients</code> - посмотреть активных клиентов и их историю
 <code>/version</code> - посмотреть версию ПО на стороне клиента
 
-<i>ver beta v35</i>"""
+<i>ver beta v37</i>"""
 
     # Добавляем кнопки управления в подменю
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main"))
@@ -838,61 +875,7 @@ async def handle_download(message: Message, command: CommandObject):
     except Exception as e:
         await message.reply(f"❌ {e}")
 
-@dp.message(Command('msg'), IsInGroup())
-async def handle_msg(message: Message, command: CommandObject):
-    thread_id = message.message_thread_id
-    args = command.args or ""
-    if not args:
-        await message.reply("❌ /msg [type] [title]/t<text>")
-        return
-    _, _, writer = await find_client_by_thread(thread_id)
-    if not writer:
-        await message.reply("❌ Оффлайн")
-        return
 
-    thread_id = message.message_thread_id
-    client_id_to_remove = None # Переменная для удаления    
-    try:
-        payload = json.dumps({"command": f"/msg {args}"}).encode('utf-8') + b'\n'
-        writer.write(payload)
-        await writer.drain()
-        await message.reply("✅ Отправлено")
-    except Exception as e:
-    # 🔥 ИСПРАВЛЕНИЕ: Если отправка не удалась (например, ConnectionResetError или BrokenPipeError)
-    
-    # 1. Помечаем клиента для удаления
-        async with clients_lock:
-            for cid, data in clients.items():
-                if data['thread_id'] == thread_id:
-                    client_id_to_remove = cid
-                    # Удаляем клиента из списка, потому что соединение мертво
-                    del clients[cid] 
-                    break
-                    
-        # 2. Уведомляем Telegram об отключении
-        if client_id_to_remove:
-            await message.reply(f"❌ Оффлайн. Клиент {client_id_to_remove} был удален из активных сессий.")
-            
-            # Отправляем сообщение в топик
-            try:
-                await bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
-                    message_thread_id=thread_id,
-                    text=f"🔴 *Клиент {client_id_to_remove} отключился (ОФФЛАЙН)!*\n(Обнаружено при попытке отправки команды)",
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass # Игнорируем сбои Telegram
-                
-        else:
-            # Если клиента не нашли, но ошибка есть (маловероятно после Heartbeat)
-            await message.reply(f"❌ Ошибка отправки команды: {e}")
-    
-        # Очищаем нерабочий writer
-        if writer:
-            writer.close()
-            
-        return
 @dp.message(Command(commands=["upload"]), IsInGroup())
 async def handle_upload_command(message: Message, command: CommandObject):
     thread_id = message.message_thread_id
