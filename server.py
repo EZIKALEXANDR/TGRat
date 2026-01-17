@@ -728,7 +728,7 @@ async def process_menu_navigation(callback: CallbackQuery):
 <code>/clients</code> - посмотреть активных клиентов и их историю
 <code>/version</code> - посмотреть версию ПО на стороне клиента
 
-<i>ver beta v37</i>"""
+<i>ver beta v35</i>"""
 
     # Добавляем кнопки управления в подменю
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_main"))
@@ -795,16 +795,21 @@ async def handle_clients(message: Message):
     async with clients_lock:
         active_ids = list(clients.keys())
 
+    # Считаем количество
+    clients_count = len(active_ids)
+
     if not active_ids:
-        await message.reply("Нет активных клиентов.")
+        await message.reply("❌ Нет активных клиентов.")
         return
 
     try:
-        chat_id_for_url = str(GROUP_CHAT_ID)[4:]
+        # Убираем -100 из ID чата для формирования ссылок
+        chat_id_for_url = str(GROUP_CHAT_ID)[4:] if str(GROUP_CHAT_ID).startswith("-100") else str(GROUP_CHAT_ID)
     except:
         chat_id_for_url = "ERROR_CHAT_ID"
 
-    response = ["*Список клиентов (Только онлайн):*\n"]
+    # Добавляем количество в заголовок
+    response = [f"🌐 *Активных клиентов:* {clients_count}\n"]
 
     for client_id in sorted(active_ids):
         thread_id = CLIENT_HISTORY_CACHE.get(client_id, {}).get('thread_id', 0)
@@ -816,10 +821,11 @@ async def handle_clients(message: Message):
         response.append(f"{client_link}\n{status_line}")
         response.append("-" * 30)
 
-    if response[-1].startswith("-"):
+    # Убираем последнюю разделительную линию, если она есть
+    if response and response[-1].startswith("-"):
         response.pop()
 
-    await message.reply('\n'.join(response), parse_mode='Markdown')
+    await message.reply('\n'.join(response), parse_mode='Markdown', disable_web_page_preview=True)
 
 @dp.message(Command('clients_off'), IsInGroup())
 async def handle_clients_off(message: Message):
